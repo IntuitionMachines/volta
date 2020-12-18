@@ -1,3 +1,8 @@
+# Notes
+
+* Forked from [volta](https://github.com/e-bug/volta)
+* This branch is for training with pytorch_xla on TPUs
+
 # VOLTA: Visiolinguistic Transformer Architectures
 
 This is the implementation of the framework described in the paper:
