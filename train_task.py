@@ -268,15 +268,13 @@ def main():
     # Train
     for epoch_id in tqdm(range(start_epoch, args.num_train_epochs), desc="Epoch"):
         model.train()
-        for step, batch in enumerate(dl_train):
+        for step, batch in tqdm(enumerate(dl_train)):
             iter_id = start_iter_id + step + (epoch_id * len(dl_train))
 
             loss, score = ForwardModelsTrain(config, task_cfg, device, task, batch, model, criterion)
-
             if args.grad_acc_steps > 1:
                 loss = loss / args.grad_acc_steps
             loss.backward()
-
             if (step + 1) % args.grad_acc_steps == 0:
                 # Clip gradient
                 if args.clip_grad_norm > 0:
