@@ -26,10 +26,8 @@ LossMap = {
     "CrossEntropyLoss": nn.CrossEntropyLoss(),
 }
 
-
 def ForwardModelsVal(config, task_cfg, device, task_id, batch, model, criterion):
-    batch = tuple(t.cuda(device=device, non_blocking=True) for t in batch)
-
+    #batch = tuple(t.to(device) for t in batch)
     if task_cfg[task_id]["type"] == "V-logit-mc":
         features, spatials, image_mask, question, target, input_mask, segment_ids, multi_choice_ids, question_id = batch
     else:
@@ -134,12 +132,12 @@ def ForwardModelsVal(config, task_cfg, device, task_id, batch, model, criterion)
         loss = loss.mean()
         batch_score = compute_score_with_logits(vil_prediction, target).sum()
 
-    return float(loss), float(batch_score), batch_size
+    #return float(loss), float(batch_score), batch_size
+    return loss, batch_score, batch_size
 
 
 def ForwardModelsTrain(config, task_cfg, device, task_id, batch, model, criterion):
-    batch = tuple(t.cuda(device=device, non_blocking=True) for t in batch)
-
+    batch = tuple(t.to(device) for t in batch)
     if task_cfg[task_id]["type"] == "V-logit-mc":
         features, spatials, image_mask, question, target, input_mask, segment_ids, multi_choice_ids, question_id = batch
     else:
@@ -249,14 +247,16 @@ def ForwardModelsTrain(config, task_cfg, device, task_id, batch, model, criterio
         vil_logit = vil_prediction.view(batch_size, num_options)
         loss = criterion(vil_logit, target)
         _, preds = torch.max(vil_logit, 1)
-        batch_score = float((preds == target).sum()) / float(batch_size)
+        #batch_score = float((preds == target).sum()) / float(batch_size)
+        batch_score = (preds == target).sum() / float(batch_size)
 
     elif task_cfg[task_id]["type"] == "V-logit":
         loss = criterion(vil_prediction, target)
         loss = loss.mean() * target.size(1)
         _, select_idx = torch.max(vil_prediction, dim=1)
         select_target = target.squeeze(2).gather(1, select_idx.view(-1, 1))
-        batch_score = float(torch.sum(select_target > 0.5)) / batch_size
+        #batch_score = float(torch.sum(select_target > 0.5)) / batch_size
+        batch_score = torch.sum(select_target > 0.5) / batch_size
 
     elif task_cfg[task_id]["type"] == "V-logit-mc":
         vision_logit = vil_prediction[:, 101:]  # FIXME from ViLBERT
@@ -266,7 +266,7 @@ def ForwardModelsTrain(config, task_cfg, device, task_id, batch, model, criterio
         loss = loss.mean() * target.size(1)
         _, preds = torch.max(vision_logit, dim=1)
         _, target = torch.max(target, dim=1)
-        batch_score = float((preds == target).sum()) / float(batch_size)
+        batch_score = (preds == target).sum() / float(batch_size)
 
     elif task_cfg[task_id]["type"] == "VL-binary-classifier":
         loss = criterion(vil_prediction, target)
@@ -287,7 +287,7 @@ def LoadLoss(task_cfg, task_id):
     return loss
 
 
-def LoadDataset(args, config, task_cfg, task_id, split="trainval"):
+def LoadDataset(args, config, task_cfg, task_id, rank, world_size, split="trainval"):
     if "roberta" in args.bert_model:
         tokenizer = RobertaTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
     else:
@@ -304,9 +304,8 @@ def LoadDataset(args, config, task_cfg, task_id, split="trainval"):
 
     batch_size = task_cfg[task]["batch_size"] // args.grad_acc_steps
     num_workers = args.num_workers
-    if args.local_rank != -1:
-        batch_size = int(batch_size / dist.get_world_size())
-        num_workers = int(num_workers / dist.get_world_size())
+    batch_size = int(batch_size / world_size)
+    num_workers = int(num_workers / world_size)
 
     logger.info("Loading %s Dataset with batch size %d" % (task_name, batch_size))
     dset_train, dset_train, task2num_iters = None, None, {}
@@ -327,16 +326,16 @@ def LoadDataset(args, config, task_cfg, task_id, split="trainval"):
             add_global_imgfeat=config.add_global_imgfeat,
             append_mask_sep=(config.fusion_method == 'vl-bert_vqa'),
         )
-        if args.local_rank == -1:
-            train_sampler = RandomSampler(dset_train)
-        else:
-            train_sampler = DistributedSampler(dset_train)
+        sampler_train = None
+        if world_size > 1:
+            sampler_train = DistributedSampler(dset_train, num_replicas=world_size, rank=rank, shuffle=True)
+
         dl_train = DataLoader(
             dset_train,
-            sampler=train_sampler,
+            sampler=sampler_train,
             batch_size=batch_size,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=False,
             drop_last=args.drop_last,
         )
         task2num_iters = {task: len(dl_train)}
@@ -359,29 +358,92 @@ def LoadDataset(args, config, task_cfg, task_id, split="trainval"):
             add_global_imgfeat=config.add_global_imgfeat,
             append_mask_sep=(config.fusion_method == 'vl-bert_vqa'),
         )
+
+        sampler_val = None
+        if world_size > 1:
+            sampler_val = DistributedSampler(dset_val, num_replicas=world_size, rank=rank, shuffle=False)
+
         dl_val = DataLoader(
             dset_val,
+            sampler=sampler_val,
             shuffle=False,
             batch_size=batch_size,
-            num_workers=2,
-            pin_memory=True,
+            num_workers=0,
+            pin_memory=False,
             drop_last=args.drop_last,
         )
 
-    return batch_size, task2num_iters, dset_train, dset_val, dl_train, dl_val
+    return batch_size, task2num_iters, dset_train, dset_val, dl_train, dl_val, sampler_train
+
+
+def LoadDatasetEval(args, config, task_cfg, task_id, rank, world_size):
+    if "roberta" in args.bert_model:
+        tokenizer = RobertaTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
+    else:
+        tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
+
+    task = "TASK" + task_id
+    task_name = task_cfg[task]["name"]
+
+    # initialize the feature reader
+    feats_h5path1 = task_cfg[task]["features_h5path1"]
+    feats_h5path2 = task_cfg[task]["features_h5path2"]
+    features_reader1 = ImageFeaturesH5Reader(feats_h5path1, config, args.in_memory) if feats_h5path1 != "" else None
+    features_reader2 = ImageFeaturesH5Reader(feats_h5path2, config, args.in_memory) if feats_h5path2 != "" else None
+
+    batch_size = task_cfg[task].get("eval_batch_size", args.batch_size)
+    batch_size = int(batch_size / world_size)
+    num_workers = int(args.num_workers / world_size)
+
+    logger.info("Loading %s Dataset with batch size %d, world_size %d" % (task_name, batch_size, world_size))
+    if args.split:
+        eval_split = args.split
+    else:
+        eval_split = task_cfg[task]["val_split"]
+
+    dset_val = DatasetMapEval[task_name](
+        task=task_cfg[task]["name"],
+        dataroot=task_cfg[task]["dataroot"],
+        annotations_jsonpath=task_cfg[task]["val_annotations_jsonpath"],
+        split=eval_split,
+        image_features_reader=features_reader1,
+        gt_image_features_reader=features_reader2,
+        tokenizer=tokenizer,
+        bert_model=args.bert_model,
+        padding_index=0,
+        max_seq_length=task_cfg[task]["max_seq_length"],
+        max_region_num=task_cfg[task]["max_region_num"],
+        num_locs=config.num_locs,
+        add_global_imgfeat=config.add_global_imgfeat,
+        append_mask_sep=(config.fusion_method == 'vl-bert_vqa')
+    )
+    sampler = None
+    if world_size > 1:
+        sampler = DistributedSampler(dset_val, num_replicas=world_size, rank=rank, shuffle=False)
+
+    dl_val = DataLoader(
+        dset_val,
+        sampler=sampler,
+        shuffle=False,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=False,
+        drop_last=args.drop_last,
+    )
+    task2num_iters = {task: len(dl_val)}
+
+    return batch_size, task2num_iters, dset_val, dl_val
 
 
 def compute_score_with_logits(logits, labels):
     logits = torch.max(logits, 1)[1].data  # argmax
-    one_hots = torch.zeros(*labels.size()).cuda()
+    one_hots = torch.zeros(*labels.size(), device=logits.device)
     one_hots.scatter_(1, logits.view(-1, 1), 1)
     scores = one_hots * labels
     return scores
 
 
 def EvaluatingModel(config, task_cfg, device, task_id, batch, model, dataloader, criterion, results, others):
-    batch = tuple(t.cuda(device=device, non_blocking=True) for t in batch)
-
     if task_cfg[task_id]["type"] == "V-logit-mc":
         features, spatials, image_mask, question, target, input_mask, segment_ids, multi_choice_ids, question_id = batch
     else:
@@ -545,7 +607,8 @@ def EvaluatingModel(config, task_cfg, device, task_id, batch, model, dataloader,
         loss = loss.mean() * target.size(1)
         _, preds = torch.max(vision_logit, dim=1)
         _, target = torch.max(target, dim=1)
-        batch_score = float((preds == target).sum())
+        #batch_score = float((preds == target).sum())
+        batch_score = (preds == target).sum()
 
         for i in range(preds.size(0)):
             results.append({"id": question_id[i].item(), "target": preds[i].item()})
@@ -560,4 +623,5 @@ def EvaluatingModel(config, task_cfg, device, task_id, batch, model, dataloader,
         loss = loss.mean()
         batch_score = compute_score_with_logits(vil_prediction, target).sum()
 
-    return float(loss), float(batch_score), batch_size, results, others
+    #return float(loss), float(batch_score), batch_size, results, others
+    return loss, batch_score, batch_size, results, others

@@ -29,6 +29,7 @@ def _load_annotations(annotations_jsonpath, task):
         entries = []
         imgid2entry = {}
         count = 0
+        #n_imgs = 0
         for annotation in reader:
             if task == "RetrievalCOCO":
                 image_id = annotation["id"]
@@ -39,6 +40,11 @@ def _load_annotations(annotations_jsonpath, task):
                 entries.append({"caption": sentences, "image_id": image_id})
                 imgid2entry[image_id].append(count)
                 count += 1
+
+            #n_imgs += 1
+            #if n_imgs > 31:
+            #    break
+
     return entries, imgid2entry
 
 
@@ -171,9 +177,9 @@ class RetrievalDataset(Dataset):
         mix_boxes_pad[:mix_num_boxes] = boxes[:mix_num_boxes]
         mix_features_pad[:mix_num_boxes] = features[:mix_num_boxes]
 
-        features1 = torch.tensor(mix_features_pad).float()
-        image_mask1 = torch.tensor(image_mask).long()
-        spatials1 = torch.tensor(mix_boxes_pad).float()
+        features1 = torch.Tensor(mix_features_pad)
+        image_mask1 = torch.as_tensor(image_mask, dtype=torch.long)
+        spatials1 = torch.Tensor(mix_boxes_pad)
 
         caption1 = entry["token"]
         input_mask1 = entry["input_mask"]
@@ -214,9 +220,9 @@ class RetrievalDataset(Dataset):
         mix_boxes_pad[:mix_num_boxes3] = boxes3[:mix_num_boxes3]
         mix_features_pad[:mix_num_boxes3] = features3[:mix_num_boxes3]
 
-        features3 = torch.tensor(mix_features_pad).float()
-        image_mask3 = torch.tensor(image_mask3).long()
-        spatials3 = torch.tensor(mix_boxes_pad).float()
+        features3 = torch.Tensor(mix_features_pad)
+        image_mask3 = torch.as_tensor(image_mask3, dtype=torch.long)
+        spatials3 = torch.Tensor(mix_boxes_pad)
 
         caption3 = caption1
         input_mask3 = input_mask1
@@ -249,6 +255,7 @@ class RetrievalDataset(Dataset):
         caption = torch.stack([caption1, caption2, caption3, caption4], dim=0)
         input_mask = torch.stack([input_mask1, input_mask2, input_mask3, input_mask4], dim=0)
         segment_ids = torch.stack([segment_ids1, segment_ids2, segment_ids3, segment_ids4], dim=0)
+
         target = 0
 
         return features, spatials, image_mask, caption, target, input_mask, segment_ids, image_id
@@ -270,6 +277,7 @@ def _load_annotationsVal(annotations_jsonpath, task):
             image_entries[image_id] = 1
             for sentences in annotation["sentences"]:
                 caption_entries.append({"caption": sentences, "image_id": image_id})
+
     image_entries = [*image_entries]
     return image_entries, caption_entries
 
@@ -290,7 +298,7 @@ class RetrievalDatasetVal(Dataset):
         max_region_num: int = 36,
         num_locs=5,
         add_global_imgfeat=None,
-        append_mask_sep=False,
+        append_mask_sep=False
     ):
         # All the keys in `self._entries` would be present in `self._image_features_reader`
         self._image_entries, self._caption_entries = _load_annotationsVal(annotations_jsonpath, task)
@@ -337,6 +345,12 @@ class RetrievalDatasetVal(Dataset):
         self.image_mask_all = torch.Tensor(self.image_mask_all).long()
         self.spatials_all = torch.Tensor(self.spatials_all).float()
 
+
+    def to(self, device):
+        self.features_all = self.features_all.squeeze(0).to(device)
+        self.image_mask_all = self.image_mask_all.squeeze(0).to(device)
+        self.spatials_all = self.spatials_all.squeeze(0).to(device)
+
     def tokenize(self):
         """Tokenizes the captions.
 
@@ -379,24 +393,26 @@ class RetrievalDatasetVal(Dataset):
         caption_idx = int(index / 2)
         image_idx = index % 2
 
+        half_num_images = int(len(self._image_entries) / 2)
+
         if image_idx == 0:
-            image_entries = self._image_entries[:500]
-            features_all = self.features_all[:500]
-            spatials_all = self.spatials_all[:500]
-            image_mask_all = self.image_mask_all[:500]
+            image_entries = self._image_entries[:half_num_images]
+            features_all = self.features_all[:half_num_images]
+            spatials_all = self.spatials_all[:half_num_images]
+            image_mask_all = self.image_mask_all[:half_num_images]
 
         else:
-            image_entries = self._image_entries[500:]
-            features_all = self.features_all[500:]
-            spatials_all = self.spatials_all[500:]
-            image_mask_all = self.image_mask_all[500:]
+            image_entries = self._image_entries[half_num_images:]
+            features_all = self.features_all[half_num_images:]
+            spatials_all = self.spatials_all[half_num_images:]
+            image_mask_all = self.image_mask_all[half_num_images:]
 
         entry = self._caption_entries[caption_idx]
         caption = entry["token"]
         input_mask = entry["input_mask"]
         segment_ids = entry["segment_ids"]
 
-        target_all = torch.zeros(500)
+        target_all = torch.zeros(half_num_images)
         for i, image_id in enumerate(image_entries):
             if image_id == entry["image_id"]:
                 target_all[i] = 1

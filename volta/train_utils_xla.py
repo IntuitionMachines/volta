@@ -10,7 +10,7 @@ from io import open
 from tensorboardX import SummaryWriter
 
 import torch
-
+import torch_xla.core.xla_model as xm
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +70,8 @@ class tbLogger(object):
 
     def linePlot(self, step, val, split, key, xlabel="None"):
         if self.save_logger:
+            if isinstance(val, torch.Tensor):
+                val = val.item()
             self.logger.add_scalar(split + "/" + key, val, step)
 
     def step_train(self, epochId, stepId, loss, score, norm, task_id, split):
@@ -137,34 +139,43 @@ class tbLogger(object):
 
         logger.info(progressInfo)
         logger.info(lossInfo)
-        print(lossInfo, file=self.txt_f)
+        #print(lossInfo, file=self.txt_f)
         return val_scores
 
     def getValScore(self, task_id):
         return self.task_score_val[task_id] / float(self.task_datasize_val[task_id])
 
     def showLossVal(self, task_id, task_stop_controller=None):
-        progressInfo = "Eval task %s on iteration %d " % (task_id, self.task_step[task_id])
+        progressInfo = "rank %d: Eval task %s on iteration %d " % (xm.get_ordinal(), task_id, self.task_step[task_id])
         lossInfo = "Validation "
-        ave_loss = 0
+
         loss = self.task_loss_val[task_id] / float(self.task_datasize_val[task_id])
         score = self.task_score_val[task_id] / float(self.task_datasize_val[task_id])
-        ave_loss += loss
-        lossInfo += "[%s]: loss %.3f score %.3f " % (self.task_id2name[task_id], loss, score * 100.0)
 
-        self.linePlot(self.task_step[task_id], loss, "val", self.task_id2name[task_id] + "_loss")
-        self.linePlot(self.task_step[task_id], score, "val", self.task_id2name[task_id] + "_score")
-        if task_stop_controller is not None:
-            self.linePlot(self.task_step[task_id], task_stop_controller[task_id].in_stop,
-                          "val", self.task_id2name[task_id] + "_early_stop")
+        scale = 1. / xm.xrt_world_size()
+        xm.all_reduce("sum", [loss], scale=scale, groups=[])
+        xm.all_reduce("sum", [score], scale=scale, groups=[])
 
+        lossInfo += "[{}]: loss {:.3f} score {:.3f} ".format(self.task_id2name[task_id], loss, score * 100.0)
+
+        def plot():
+            self.linePlot(self.task_step[task_id], loss, "val", self.task_id2name[task_id] + "_loss")
+            self.linePlot(self.task_step[task_id], score, "val", self.task_id2name[task_id] + "_score")
+
+            if task_stop_controller is not None:
+                self.linePlot(self.task_step[task_id], task_stop_controller[task_id].in_stop,
+                              "val", self.task_id2name[task_id] + "_early_stop")
+
+        xm.add_step_closure(plot)
+
+        logger.info(progressInfo)
+        logger.info(lossInfo)
         self.task_loss_val[task_id] = 0
         self.task_score_val[task_id] = 0
         self.task_datasize_val[task_id] = 0
         self.task_step_val[task_id] = 0
-        logger.info(progressInfo)
-        logger.info(lossInfo)
-        print(lossInfo, file=self.txt_f)
+
+        #print(lossInfo, file=self.txt_f)
         return score
 
     def showLossTrain(self):
@@ -185,7 +196,7 @@ class tbLogger(object):
                     )
 
         logger.info(lossInfo)
-        print(lossInfo, file=self.txt_f)
+        #print(lossInfo, file=self.txt_f)
 
         self.task_step_tmp = {task_id: 0 for task_id in self.task_ids}
         self.task_loss_tmp = {task_id: 0 for task_id in self.task_ids}
@@ -217,7 +228,7 @@ class tbLogger(object):
         self.task_step_val = {task_id: 0 for task_id in self.task_ids}
 
         logger.info(lossInfo)
-        print(lossInfo, file=self.txt_f)
+        #print(lossInfo, file=self.txt_f)
 
     def showLossTrainCC(self):
         # show the current loss, once showed, reset the loss.
@@ -238,7 +249,7 @@ class tbLogger(object):
                     )
 
         logger.info(lossInfo)
-        print(lossInfo, file=self.txt_f)
+        #print(lossInfo, file=self.txt_f)
 
         self.task_step_tmp = {task_id: 0 for task_id in self.task_ids}
         self.masked_t_loss = {task_id: 0 for task_id in self.task_ids}
@@ -292,28 +303,35 @@ def summary_parameters(model, logger=None):
     print_and_log('>> {:25s}\t{:.2f}\tM'.format('# TotalParams:', total_params / (1.0 * 10 ** 6)), logger)
 
 
-def save(path, logger, epoch_id, model, optimizer, scheduler, global_step, tb_logger, default_gpu, score=None):
-    if default_gpu:
-        # Save a trained model
-        logger.info("** ** * Saving model * ** ** ")
-        model_to_save = model.module if hasattr(model, "module") else model  # Only save the model it-self
-        output_model_file = os.path.join(path, "pytorch_model_" + str(epoch_id) + ".bin")
-        torch.save(model_to_save.state_dict(), output_model_file)
-        if score is not None:
-            output_model_file = os.path.join(path, "pytorch_model_best.bin")
-            torch.save(model_to_save.state_dict(), output_model_file)
-        output_checkpoint = os.path.join(path, "pytorch_ckpt_latest.tar")
-        torch.save(
-            {"model_state_dict": model_to_save.state_dict(),
-             "optimizer_state_dict": optimizer.state_dict(),
-             "scheduler_state_dict": scheduler.state_dict(),
-             "global_step": global_step,
-             "epoch_id": epoch_id,
-             "tb_logger": tb_logger,
-             "score": score,
-             },
-            output_checkpoint,
-        )
+def save(path, logger, epoch_id, model, optimizer, scheduler, global_step, tb_logger, default_tpu, score=None):
+    # Save a trained model
+
+    xm.master_print("** ** * Saving model * ** ** ")
+    model_to_save = model.module if hasattr(model, "module") else model  # Only save the model it-self
+    output_model_file = os.path.join(path, "pytorch_model_" + str(epoch_id) + ".bin")
+    xm.save(model_to_save.state_dict(), output_model_file)
+    xm.master_print("** ** * Dumped model to {} * ** ** ".format(output_model_file))
+
+    if score is not None:
+        output_model_file = os.path.join(path, "pytorch_model_best.bin")
+        xm.save(model_to_save.state_dict(), output_model_file)
+        xm.master_print("** ** * Dumped model to {} * ** ** ".format(output_model_file))
+
+    output_checkpoint = os.path.join(path, "pytorch_ckpt_latest.tar")
+    xm.save(
+        {"model_state_dict": model_to_save.state_dict(),
+         "optimizer_state_dict": optimizer.state_dict(),
+         "scheduler_state_dict": scheduler.state_dict(),
+         "global_step": global_step,
+         "epoch_id": epoch_id,
+         # todo (fix): uncommenting this causes
+         # RuntimeError: Queue objects should only be shared between processes through inheritance
+         #"tb_logger": tb_logger,
+         "score": score,
+         },
+        output_checkpoint,
+    )
+    xm.master_print("** ** * Dumped model to {} * ** ** ".format(output_checkpoint))
 
 
 def resume(path, model, optimizer, scheduler, tb_logger):
@@ -330,12 +348,16 @@ def resume(path, model, optimizer, scheduler, tb_logger):
             else:
                 new_dict[attr] = checkpoint["model_state_dict"][attr]
         model.load_state_dict(new_dict)
-        scheduler.load_state_dict(checkpoint.get("scheduler_state_dict", checkpoint["warmup_scheduler_state_dict"]))
+        scheduler.load_state_dict(checkpoint.get("scheduler_state_dict", checkpoint["scheduler_state_dict"]))
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         global_step = checkpoint["global_step"]
         start_epoch = int(checkpoint["epoch_id"]) + 1
-        if tb_logger:
+        if "tb_logger" in checkpoint:
             tb_logger = checkpoint["tb_logger"]
         best_score = checkpoint.get("score", float("-inf"))
         del checkpoint
+    else:
+        if path != "" and not os.path.exists(path):
+            assert FileNotFoundError, '{} not exists!'.format(path)
+
     return start_iter_id, global_step, start_epoch, tb_logger, best_score
