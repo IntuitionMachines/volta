@@ -153,8 +153,9 @@ class tbLogger(object):
         score = self.task_score_val[task_id] / float(self.task_datasize_val[task_id])
 
         scale = 1. / xm.xrt_world_size()
-        xm.all_reduce("sum", [loss], scale=scale, groups=[])
-        xm.all_reduce("sum", [score], scale=scale, groups=[])
+        if xm.xrt_world_size() > 1:
+            xm.all_reduce("sum", [loss], scale=scale, groups=[])
+            xm.all_reduce("sum", [score], scale=scale, groups=[])
 
         lossInfo += "[{}]: loss {:.3f} score {:.3f} ".format(self.task_id2name[task_id], loss, score * 100.0)
 

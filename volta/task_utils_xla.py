@@ -27,7 +27,7 @@ LossMap = {
 }
 
 def ForwardModelsVal(config, task_cfg, device, task_id, batch, model, criterion):
-    #batch = tuple(t.to(device) for t in batch)
+    batch = tuple(t.to(device) for t in batch)
     if task_cfg[task_id]["type"] == "V-logit-mc":
         features, spatials, image_mask, question, target, input_mask, segment_ids, multi_choice_ids, question_id = batch
     else:
@@ -366,6 +366,7 @@ def LoadDataset(args, config, task_cfg, task_id, rank, world_size, split="trainv
         dl_val = DataLoader(
             dset_val,
             sampler=sampler_val,
+            #sampler=None,
             shuffle=False,
             batch_size=batch_size,
             num_workers=0,

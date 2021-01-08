@@ -257,7 +257,7 @@ def train(device_id, args):
         resume(args.resume_file, model, optimizer, scheduler, tb_logger)
 
     # Pre-evaluate
-    #evaluate(config, dl_val, task_cfg, device, task, model, criterion, start_epoch, default_tpu, tb_logger)
+    evaluate(config, dl_val, task_cfg, device, task, model, criterion, start_epoch, default_tpu, tb_logger)
 
     # Save starting model
     save(save_path, logger, -1, model, optimizer, scheduler, global_step, tb_logger, default_tpu)
@@ -275,11 +275,11 @@ def train(device_id, args):
     for epoch_id in tqdm(range(start_epoch, args.num_train_epochs), desc="Epoch"):
         model.train()
         sampler_train.set_epoch(epoch_id)
-        #pl_loader = pl.ParallelLoader(dl_train, [device]).per_device_loader(device)
-        for step, batch in tqdm(enumerate(dl_train)):
-        #for step, batch in tqdm(enumerate(pl_loader)):
-            iter_id = start_iter_id + step + (epoch_id * len(dl_train))
-            #iter_id = start_iter_id + step + (epoch_id * len(pl_loader))
+        pl_loader = pl.ParallelLoader(dl_train, [device]).per_device_loader(device)
+        #for step, batch in tqdm(enumerate(dl_train)):
+        for step, batch in tqdm(enumerate(pl_loader)):
+            #iter_id = start_iter_id + step + (epoch_id * len(dl_train))
+            iter_id = start_iter_id + step + (epoch_id * len(pl_loader))
 
             loss, score = ForwardModelsTrain(config, task_cfg, device, task, batch, model, criterion)
             if args.grad_acc_steps > 1:
@@ -291,7 +291,8 @@ def train(device_id, args):
                 if args.clip_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
 
-                xm.optimizer_step(optimizer, barrier=True)
+                #xm.optimizer_step(optimizer, barrier=True)
+                xm.optimizer_step(optimizer)
 
                 if global_step < warmup_steps or args.lr_scheduler == "warmup_linear":
                     scheduler.step()
@@ -332,7 +333,6 @@ def evaluate(config, dataloader_val, task_cfg, device, task_id, model, criterion
     pl_loader = pl.ParallelLoader(dataloader_val, [device]).per_device_loader(device)
     for i, batch in tqdm(enumerate(pl_loader)):
         loss, score, batch_size = ForwardModelsVal(config, task_cfg, device, task_id, batch, model, criterion)
-        xm.mark_step()
         if tb_logger:
             tb_logger.step_val(epoch_id, loss, score, task_id, batch_size, "val")
 
@@ -353,4 +353,4 @@ if __name__ == "__main__":
     os.environ["XRT_TPU_CONFIG"] = f"tpu_worker;0;{args.tpu_ip_address}:{args.tpu_port}"
     os.environ['XLA_USE_BF16'] = "0"
     torch.set_default_tensor_type('torch.FloatTensor')
-    xmp.spawn(node_run, args=(args,), nprocs=args.nprocs, start_method='fork')
+    xmp.spawn(node_run, args=(args,), nprocs=args.nprocs)
