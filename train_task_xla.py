@@ -300,7 +300,6 @@ def train(device_id, args):
                 model.zero_grad()
                 global_step += 1
 
-                #if default_tpu and iter_id % args.logfreq == 0:
                 if iter_id % args.logfreq == 0:
                     xm.add_step_closure(tb_logger.step_train, args=(epoch_id, iter_id, loss, score,
                                                                     optimizer.param_groups[0]["lr"], task, "train"))
@@ -331,16 +330,19 @@ def node_run(device_id, args):
 def evaluate(config, dataloader_val, task_cfg, device, task_id, model, criterion, epoch_id, default_tpu, tb_logger):
     model.eval()
     pl_loader = pl.ParallelLoader(dataloader_val, [device]).per_device_loader(device)
+    #for i, batch in tqdm(enumerate(dataloader_val)):
     for i, batch in tqdm(enumerate(pl_loader)):
         loss, score, batch_size = ForwardModelsVal(config, task_cfg, device, task_id, batch, model, criterion)
         if tb_logger:
             tb_logger.step_val(epoch_id, loss, score, task_id, batch_size, "val")
+        #xm.mark_step()
+        break
 
     score = -1
+    xm.mark_step()
     if tb_logger:
         score = tb_logger.showLossVal(task_id)
 
-    model.train()
     return score
 
 
