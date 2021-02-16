@@ -86,6 +86,8 @@ class InputExample(object):
         image_loc=None,
         num_boxes=None,
         overlaps=None,
+        obj_tokens=None,
+        attr_tokens=None
     ):
         """Constructs a InputExample.
         Args:
@@ -110,6 +112,8 @@ class InputExample(object):
         self.image_attrs = image_attrs
         self.num_boxes = num_boxes
         self.overlaps = overlaps
+        self.obj_tokens = obj_tokens
+        self.attr_tokens = attr_tokens
 
 
 class InputFeatures(object):
@@ -132,6 +136,8 @@ class InputFeatures(object):
         image_loc=None,
         image_label=None,
         image_mask=None,
+        obj_tokens=None,
+        attr_tokens=None,
         masked_label=None,
     ):
         self.input_ids = input_ids
@@ -149,6 +155,8 @@ class InputFeatures(object):
         self.attr_confs = attr_confs
         self.image_attrs = image_attrs
         self.image_mask = image_mask
+        self.obj_tokens = obj_tokens
+        self.attr_tokens = attr_tokens
         self.masked_label = masked_label
 
 
@@ -189,8 +197,8 @@ class ConceptCapLoaderTrain(object):
         objective=0,
         num_locs=5,
         add_global_imgfeat=None,
+        visual_target_categories_file=None
     ):
-
         if dist.is_available() and local_rank != -1:
             rank = dist.get_rank()
             lmdb_file = os.path.join(features_path, "training_feat_part_" + str(rank) + ".lmdb")
@@ -213,10 +221,12 @@ class ConceptCapLoaderTrain(object):
             self.num_dataset,
             objective=objective,
             num_locs=num_locs,
+            visual_target_categories_file=visual_target_categories_file
         )
 
-        ds = td.PrefetchData(ds, 5000, 1)
+        ds = td.PrefetchData(ds, 10000, 1)
         ds = td.MapData(ds, preprocess_function)
+
         ds = td.PrefetchDataZMQ(ds, num_workers)
         self.ds = td.BatchData(ds, batch_size)
         self.ds.reset_state()
@@ -225,12 +235,21 @@ class ConceptCapLoaderTrain(object):
         self.num_workers = num_workers
         self.add_global_imgfeat = add_global_imgfeat
         self.num_locs = num_locs
+        self.tokenize_visual_categories = preprocess_function.tokenize_visual_categories
+        self.preprocess_function = preprocess_function
 
     def __iter__(self):
-
         for batch in self.ds.get_data():
-            input_ids, input_mask, segment_ids, lm_label_ids, is_next, image_feat, image_loc, \
-                image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs, image_label, image_mask, masked_label, image_id = batch
+
+            # obj_labels \in [0, 1599], "background" class not included
+            if self.tokenize_visual_categories:
+                input_ids, input_mask, segment_ids, lm_label_ids, is_next, image_feat, image_loc, \
+                    image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs, image_label, \
+                image_mask, masked_label, obj_tokens, attr_tokens, image_id = batch
+            else:
+                input_ids, input_mask, segment_ids, lm_label_ids, is_next, image_feat, image_loc, \
+                image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs, image_label, \
+                image_mask, masked_label, image_id = batch
 
             batch_size = input_ids.shape[0]
 
@@ -264,26 +283,49 @@ class ConceptCapLoaderTrain(object):
                 g_image_mask = np.repeat(np.array([[1]]), batch_size, axis=0)
                 image_mask = np.concatenate([image_mask, g_image_mask], axis=1)
 
+            if self.tokenize_visual_categories:
+                batch = (
+                    input_ids,
+                    input_mask,
+                    segment_ids,
+                    lm_label_ids,
+                    is_next,
+                    image_feat,
+                    image_loc,
+                    image_cls,
+                    obj_labels,
+                    obj_confs,
+                    attr_labels,
+                    attr_confs,
+                    image_attrs,
+                    image_label,
+                    image_mask,
+                    obj_tokens,
+                    attr_tokens,
+                    image_id
+                )
+            else:
+                batch = (
+                    input_ids,
+                    input_mask,
+                    segment_ids,
+                    lm_label_ids,
+                    is_next,
+                    image_feat,
+                    image_loc,
+                    image_cls,
+                    obj_labels,
+                    obj_confs,
+                    attr_labels,
+                    attr_confs,
+                    image_attrs,
+                    image_label,
+                    image_mask,
+                    image_id
+                )
 
-            batch = (
-                input_ids,
-                input_mask,
-                segment_ids,
-                lm_label_ids,
-                is_next,
-                image_feat,
-                image_loc,
-                image_cls,
-                obj_labels,
-                obj_confs,
-                attr_labels,
-                attr_confs,
-                image_attrs,
-                image_label,
-                image_mask,
-            )
-
-            yield tuple([torch.tensor(data) for data in batch] + [image_id])
+            yield batch
+            #yield [torch.tensor(data) for data in batch] + [image_id]
 
     def __len__(self):
         return self.ds.size()
@@ -326,6 +368,7 @@ class ConceptCapLoaderVal(object):
             num_locs=5,
             add_global_imgfeat=True,
             visualization=False,
+            visual_target_categories_file=None
     ):
         lmdb_file = os.path.join(features_path, "validation_feat_all.lmdb")
         caption_path = os.path.join(annotations_path, "caption_valid.json")
@@ -343,6 +386,7 @@ class ConceptCapLoaderVal(object):
             visualization=visualization,
             objective=objective,
             num_locs=num_locs,
+            visual_target_categories_file=visual_target_categories_file
         )
 
         ds = td.MapData(ds, preprocess_function)
@@ -353,11 +397,18 @@ class ConceptCapLoaderVal(object):
         self.num_workers = num_workers
         self.add_global_imgfeat = add_global_imgfeat
         self.num_locs = num_locs
+        self.tokenize_visual_categories = preprocess_function.tokenize_visual_categories
 
     def __iter__(self):
         for batch in self.ds.get_data():
-            input_ids, input_mask, segment_ids, lm_label_ids, is_next, image_feat, image_loc, \
-                image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs, image_label, image_mask, masked_label, image_id = batch
+            if self.tokenize_visual_categories:
+                input_ids, input_mask, segment_ids, lm_label_ids, is_next, image_feat, image_loc, \
+                    image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs, image_label, \
+                image_mask, masked_label, obj_tokens, attr_tokens, image_id = batch
+            else:
+                input_ids, input_mask, segment_ids, lm_label_ids, is_next, image_feat, image_loc, \
+                image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs, image_label, \
+                image_mask, masked_label, image_id = batch
 
             batch_size = input_ids.shape[0]
 
@@ -376,24 +427,44 @@ class ConceptCapLoaderVal(object):
                 g_image_mask = np.repeat(np.array([[1]]), batch_size, axis=0)
                 image_mask = np.concatenate([g_image_mask, image_mask], axis=1)
 
-            batch = (
-                input_ids,
-                input_mask,
-                segment_ids,
-                lm_label_ids,
-                is_next,
-                image_feat,
-                image_loc,
-                image_cls,
-                obj_labels,
-                obj_confs,
-                attr_labels,
-                attr_confs,
-                image_attrs,
-                image_label,
-                image_mask,
-            )
-
+            if self.tokenize_visual_categories:
+                batch = (
+                    input_ids,
+                    input_mask,
+                    segment_ids,
+                    lm_label_ids,
+                    is_next,
+                    image_feat,
+                    image_loc,
+                    image_cls,
+                    obj_labels,
+                    obj_confs,
+                    attr_labels,
+                    attr_confs,
+                    image_attrs,
+                    image_label,
+                    image_mask,
+                    obj_tokens,
+                    attr_tokens
+                )
+            else:
+                batch = (
+                    input_ids,
+                    input_mask,
+                    segment_ids,
+                    lm_label_ids,
+                    is_next,
+                    image_feat,
+                    image_loc,
+                    image_cls,
+                    obj_labels,
+                    obj_confs,
+                    attr_labels,
+                    attr_confs,
+                    image_attrs,
+                    image_label,
+                    image_mask
+                )
             yield tuple([torch.tensor(data) for data in batch] + [image_id])
 
     def __len__(self):
@@ -413,6 +484,7 @@ class BertPreprocessBatch(object):
             visualization=False,
             objective=0,
             num_locs=5,
+            visual_target_categories_file=None
     ):
 
         self.split = split
@@ -425,6 +497,18 @@ class BertPreprocessBatch(object):
         self.objective = objective
         self.bert_model = bert_model
         self.num_locs = num_locs
+        self.vis_categories = None
+        self.vis_att_categories = None
+
+        self.get_visual_categories(visual_target_categories_file)
+        self.tokenize_visual_categories = True if (self.vis_categories is not None and
+                                                   self.vis_att_categories is not None) else False
+
+    def _img_token_to_name(self, obj_labels, attr_labels):
+        obj_tokens = [self.vis_category_to_tokenIds[i] for i in obj_labels]
+        attr_tokens = [self.vis_att_category_to_tokenIds[i] for i in attr_labels]
+
+        return obj_tokens, attr_tokens
 
     def __call__(self, data):
         image_feature_wp, image_cls_wp, obj_labels, obj_confs, attr_labels, attr_confs, attr_scores, \
@@ -448,6 +532,9 @@ class BertPreprocessBatch(object):
         attr_labels = attr_labels[:num_boxes]
         attr_confs = attr_confs[:num_boxes]
 
+        if self.tokenize_visual_categories:
+            obj_tokens, attr_tokens = self._img_token_to_name(obj_labels, attr_labels)
+
         if self.num_locs == 5:
             image_location[:, 4] = (
                 (image_location[:, 3] - image_location[:, 1])
@@ -464,44 +551,100 @@ class BertPreprocessBatch(object):
         caption, label = self.random_cap(caption)
         tokens_caption = self.tokenizer.encode(caption)
 
-        cur_example = InputExample(
-            image_feat=image_feature,
-            image_cls=image_cls,
-            obj_labels=obj_labels,
-            obj_confs=obj_confs,
-            attr_labels=attr_labels,
-            attr_confs=attr_confs,
-            image_attrs=image_attrs,
-            caption=tokens_caption,
-            is_next=label,
-            image_loc=image_location,
-            num_boxes=num_boxes,
-            overlaps=overlaps,
-        )
+        example = dict(image_feat=image_feature,
+                       image_cls=image_cls,
+                       obj_labels=obj_labels,
+                       obj_confs=obj_confs,
+                       attr_labels=attr_labels,
+                       attr_confs=attr_confs,
+                       image_attrs=image_attrs,
+                       caption=tokens_caption,
+                       is_next=label,
+                       image_loc=image_location,
+                       num_boxes=num_boxes,
+                       overlaps=overlaps)
+        if self.tokenize_visual_categories:
+            example.update(dict(obj_tokens=obj_tokens, attr_tokens=attr_tokens))
 
+        cur_example = InputExample(**example)
         # transform sample to features
         cur_features = self.convert_example_to_features(cur_example, self.seq_len, self.tokenizer, self.region_len)
 
-        cur_tensors = (
-            cur_features.input_ids,
-            cur_features.input_mask,
-            cur_features.segment_ids,
-            cur_features.lm_label_ids,
-            cur_features.is_next,
-            cur_features.image_feat,
-            cur_features.image_loc,
-            cur_features.image_cls,
-            cur_features.obj_labels,
-            cur_features.obj_confs,
-            cur_features.attr_labels,
-            cur_features.attr_confs,
-            cur_features.image_attrs,
-            cur_features.image_label,
-            cur_features.image_mask,
-            cur_features.masked_label,
-            image_id,
-        )
+        if self.tokenize_visual_categories:
+            cur_tensors = (
+                cur_features.input_ids,
+                cur_features.input_mask,
+                cur_features.segment_ids,
+                cur_features.lm_label_ids,
+                cur_features.is_next,
+                cur_features.image_feat,
+                cur_features.image_loc,
+                cur_features.image_cls,
+                cur_features.obj_labels,
+                cur_features.obj_confs,
+                cur_features.attr_labels,
+                cur_features.attr_confs,
+                cur_features.image_attrs,
+                cur_features.image_label,
+                cur_features.image_mask,
+                cur_features.masked_label,
+                cur_features.obj_tokens,
+                cur_features.attr_tokens,
+                image_id,
+            )
+        else:
+            cur_tensors = (
+                cur_features.input_ids,
+                cur_features.input_mask,
+                cur_features.segment_ids,
+                cur_features.lm_label_ids,
+                cur_features.is_next,
+                cur_features.image_feat,
+                cur_features.image_loc,
+                cur_features.image_cls,
+                cur_features.obj_labels,
+                cur_features.obj_confs,
+                cur_features.attr_labels,
+                cur_features.attr_confs,
+                cur_features.image_attrs,
+                cur_features.image_label,
+                cur_features.image_mask,
+                cur_features.masked_label,
+                image_id,
+            )
         return cur_tensors
+
+    def get_visual_categories(self, path, max_length=5):
+        import json
+        self.vis_categories, self.vis_att_categories = None, None
+        if path is not None and os.path.exists(path):
+            with open(path, 'rb') as rp:
+                categories = json.load(rp)
+            self.vis_categories = [item['name'] for item in categories['categories']]
+            self.vis_att_categories = [item['name'] for item in categories['attCategories']]
+            logger.info('found {} / {} obj / att categories in {}'.format(len(self.vis_categories),
+                                                                          len(self.vis_att_categories),
+                                                                          path))
+            '''
+                e.g. category 0 is 'yolk' (whose id is 0)
+                self.vis_category_to_tokenIds[0] converts 0 to a sequence of language tokens [10930, 13687, 0, 0, 0], 
+                where 0 are [PAD] tokens. Number of zeros is according to `max_length`.
+            '''
+
+            self.vis_category_to_tokenIds = []
+            self.vis_att_category_to_tokenIds = []
+            for item in categories['categories']:
+                tokens = self.tokenizer.encode(item['name'])
+                out_tokens = [0] * max_length
+                out_tokens[0:len(tokens)] = tokens
+                self.vis_category_to_tokenIds.append(out_tokens)
+            self.vis_category_to_tokenIds = np.array(self.vis_category_to_tokenIds)
+            for item in categories['attCategories']:
+                tokens = self.tokenizer.encode(item['name'])
+                out_tokens = [0] * max_length
+                out_tokens[0:len(tokens)] = tokens
+                self.vis_att_category_to_tokenIds.append(out_tokens)
+            self.vis_att_category_to_tokenIds = np.array(self.vis_att_category_to_tokenIds)
 
     def random_cap(self, caption):
         """
@@ -514,10 +657,15 @@ class BertPreprocessBatch(object):
         if self.visualization:
             return caption, 0
 
-        if self.objective != 2 and random.random() > 0.5:
+        if (self.objective == 0 or self.objective == 1 or self.objective == 3) and random.random() > 0.5:
+            caption = self.get_random_caption()
+            label = 1
+        elif self.objective == 4:
+            # objective 4, always sample negative pairs
             caption = self.get_random_caption()
             label = 1
         else:
+            # objective 2, do not sample negative pairs
             label = 0
 
         return caption, label
@@ -572,6 +720,14 @@ class BertPreprocessBatch(object):
             segment_ids.append(0)
             lm_label_ids.append(-1)
 
+        while len(example.obj_tokens) < max_region_length:
+            num_tokens = len(example.obj_tokens[0])
+            example.obj_tokens.append([0] * num_tokens)
+
+        while len(example.attr_tokens) < max_region_length:
+            num_tokens = len(example.attr_tokens[0])
+            example.attr_tokens.append([0] * num_tokens)
+
         assert len(input_ids) == max_seq_length
         assert len(input_mask) == max_seq_length
         assert len(segment_ids) == max_seq_length
@@ -579,24 +735,29 @@ class BertPreprocessBatch(object):
         assert len(image_mask) == max_region_length
         assert len(image_label) == max_region_length
 
-        features = InputFeatures(
-            input_ids=np.array(input_ids),
-            input_mask=np.array(input_mask),
-            segment_ids=np.array(segment_ids),
-            lm_label_ids=np.array(lm_label_ids),
-            is_next=np.array(example.is_next),
-            image_feat=image_feat,
-            image_cls=image_cls,
-            obj_labels=example.obj_labels,
-            obj_confs=example.obj_confs,
-            attr_labels=example.attr_labels,
-            attr_confs=example.attr_confs,
-            image_attrs=example.image_attrs,
-            image_loc=image_loc,
-            image_label=np.array(image_label),
-            image_mask=np.array(image_mask),
-            masked_label=masked_label,
-        )
+        inputs = dict(input_ids=np.array(input_ids),
+                      input_mask=np.array(input_mask),
+                      segment_ids=np.array(segment_ids),
+                      lm_label_ids=np.array(lm_label_ids),
+                      is_next=np.array(example.is_next),
+                      image_feat=image_feat,
+                      image_cls=image_cls,
+                      obj_labels=example.obj_labels,
+                      obj_confs=example.obj_confs,
+                      attr_labels=example.attr_labels,
+                      attr_confs=example.attr_confs,
+                      image_attrs=example.image_attrs,
+                      image_loc=image_loc,
+                      image_label=np.array(image_label),
+                      image_mask=np.array(image_mask),
+                      masked_label=masked_label)
+
+        if self.tokenize_visual_categories:
+            assert len(example.obj_tokens) == max_region_length
+            assert len(example.attr_tokens) == max_region_length
+            inputs.update(dict(obj_tokens=np.array(example.obj_tokens), attr_tokens=np.array(example.attr_tokens)))
+
+        features = InputFeatures(**inputs)
         return features
 
     def _truncate_seq_pair(self, tokens_b, max_length):

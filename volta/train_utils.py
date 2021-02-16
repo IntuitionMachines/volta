@@ -47,10 +47,20 @@ class tbLogger(object):
         self.masked_t_loss = {task_id: 0 for task_id in task_ids}
         self.masked_v_loss = {task_id: 0 for task_id in task_ids}
         self.next_sentense_loss = {task_id: 0 for task_id in task_ids}
+        self.discriminator_loss_t = {task_id: 0 for task_id in task_ids}
+        self.discriminator_loss_v = {task_id: 0 for task_id in task_ids}
+        self.conf_discriminator_loss_t = {task_id: 0 for task_id in task_ids}
+        self.conf_discriminator_loss_v = {task_id: 0 for task_id in task_ids}
+        self.multilabel_loss_t = {task_id: 0 for task_id in task_ids}
+        self.multilabel_loss_v = {task_id: 0 for task_id in task_ids}
 
         self.masked_t_loss_val = {task_id: 0 for task_id in task_ids}
         self.masked_v_loss_val = {task_id: 0 for task_id in task_ids}
         self.next_sentense_loss_val = {task_id: 0 for task_id in task_ids}
+        self.discriminator_loss_val_t = {task_id: 0 for task_id in task_ids}
+        self.discriminator_loss_val_v = {task_id: 0 for task_id in task_ids}
+        self.multilabel_loss_val_t = {task_id: 0 for task_id in task_ids}
+        self.multilabel_loss_val_v = {task_id: 0 for task_id in task_ids}
 
     def __getstate__(self):
         d = dict(self.__dict__)
@@ -64,6 +74,16 @@ class tbLogger(object):
             self.logger = SummaryWriter(log_dir=self.log_dir)
 
         self.txt_f = open(self.txt_dir + "/" + "out.txt", "a")
+
+    @staticmethod
+    def _detach_or_return_zero(x):
+        if isinstance(x, torch.Tensor):
+            return x.detach()
+        else:
+            if x:
+                return x
+            else:
+                return 0
 
     def txt_close(self):
         self.txt_f.close()
@@ -86,10 +106,29 @@ class tbLogger(object):
         self.linePlot(stepId, score, split, self.task_id2name[task_id] + "_score")
         self.linePlot(stepId, norm, split, self.task_id2name[task_id] + "_norm")
 
-    def step_train_CC(self, epochId, stepId, masked_loss_t, masked_loss_v, next_sentence_loss, norm, task_id, split):
+    def step_train_CC(self, epochId, stepId, masked_loss_t, masked_loss_v, next_sentence_loss,
+                      discriminator_loss_t, discriminator_loss_v,
+                      conf_discriminator_loss_t, conf_discriminator_loss_v,
+                      multilabel_loss_t, multilabel_loss_v, norm, task_id, split, plotline=True):
+        masked_loss_t = self._detach_or_return_zero(masked_loss_t)
+        masked_loss_v = self._detach_or_return_zero(masked_loss_v)
+        next_sentence_loss = self._detach_or_return_zero(next_sentence_loss)
+        discriminator_loss_t = self._detach_or_return_zero(discriminator_loss_t)
+        discriminator_loss_v = self._detach_or_return_zero(discriminator_loss_v)
+        conf_discriminator_loss_t = self._detach_or_return_zero(conf_discriminator_loss_t)
+        conf_discriminator_loss_v = self._detach_or_return_zero(conf_discriminator_loss_v)
+        multilabel_loss_t = self._detach_or_return_zero(multilabel_loss_t)
+        multilabel_loss_v = self._detach_or_return_zero(multilabel_loss_v)
+
         self.masked_t_loss[task_id] += masked_loss_t
         self.masked_v_loss[task_id] += masked_loss_v
         self.next_sentense_loss[task_id] += next_sentence_loss
+        self.discriminator_loss_t[task_id] += discriminator_loss_t
+        self.discriminator_loss_v[task_id] += discriminator_loss_v
+        self.conf_discriminator_loss_t[task_id] += conf_discriminator_loss_t
+        self.conf_discriminator_loss_v[task_id] += conf_discriminator_loss_v
+        self.multilabel_loss_t[task_id] += multilabel_loss_t
+        self.multilabel_loss_v[task_id] += multilabel_loss_v
         self.task_norm_tmp[task_id] += norm
 
         self.task_step[task_id] += self.gradient_accumulation_steps
@@ -97,9 +136,17 @@ class tbLogger(object):
         self.epochId = epochId
 
         # plot on tensorboard.
-        self.linePlot(stepId, masked_loss_t, split, self.task_id2name[task_id] + "_masked_loss_t")
-        self.linePlot(stepId, masked_loss_v, split, self.task_id2name[task_id] + "_masked_loss_v")
-        self.linePlot(stepId, next_sentence_loss, split, self.task_id2name[task_id] + "_next_sentence_loss")
+        if plotline:
+            self.linePlot(stepId, masked_loss_t, split, self.task_id2name[task_id] + "_masked_loss_t")
+            self.linePlot(stepId, masked_loss_v, split, self.task_id2name[task_id] + "_masked_loss_v")
+            self.linePlot(stepId, next_sentence_loss, split, self.task_id2name[task_id] + "_next_sentence_loss")
+            self.linePlot(stepId, discriminator_loss_t, split, self.task_id2name[task_id] + "_disc_loss_t")
+            self.linePlot(stepId, discriminator_loss_v, split, self.task_id2name[task_id] + "_disc_loss_v")
+            self.linePlot(stepId, multilabel_loss_t, split, self.task_id2name[task_id] + "_multilabel_loss_t")
+            self.linePlot(stepId, multilabel_loss_v, split, self.task_id2name[task_id] + "_multilabel_loss_v")
+            self.linePlot(stepId, conf_discriminator_loss_t, split, self.task_id2name[task_id] + "_conf_disc_loss_t")
+            self.linePlot(stepId, conf_discriminator_loss_v, split, self.task_id2name[task_id] + "_conf_disc_loss_v")
+
 
     def step_val(self, epochId, loss, score, task_id, batch_size, split):
         self.task_loss_val[task_id] += loss * batch_size
@@ -107,10 +154,16 @@ class tbLogger(object):
         self.task_step_val[task_id] += self.gradient_accumulation_steps
         self.task_datasize_val[task_id] += batch_size
 
-    def step_val_CC(self, epochId, masked_loss_t, masked_loss_v, next_sentence_loss, task_id, batch_size, split):
+    def step_val_CC(self, epochId, masked_loss_t, masked_loss_v, next_sentence_loss,
+                    discriminator_loss_t, discriminator_loss_v,
+                    multilabel_loss_t, multilabel_loss_v, task_id, batch_size, split):
         self.masked_t_loss_val[task_id] += masked_loss_t
         self.masked_v_loss_val[task_id] += masked_loss_v
         self.next_sentense_loss_val[task_id] += next_sentence_loss
+        self.discriminator_loss_val_t[task_id] += discriminator_loss_t
+        self.discriminator_loss_val_v[task_id] += discriminator_loss_v
+        self.multilabel_loss_val_t[task_id] += multilabel_loss_t
+        self.multilabel_loss_val_v[task_id] += multilabel_loss_v
 
         self.task_step_val[task_id] += self.gradient_accumulation_steps
         self.task_datasize_val[task_id] += batch_size
@@ -198,7 +251,10 @@ class tbLogger(object):
             masked_t_loss_val = self.masked_t_loss_val[task_id] / float(self.task_step_val[task_id])
             masked_v_loss_val = self.masked_v_loss_val[task_id] / float(self.task_step_val[task_id])
             next_sentense_loss_val = self.next_sentense_loss_val[task_id] / float(self.task_step_val[task_id])
-
+            discriminator_loss_val_t = self.discriminator_loss_val_t[task_id] / float(self.task_step_val[task_id])
+            discriminator_loss_val_v = self.discriminator_loss_val_v[task_id] / float(self.task_step_val[task_id])
+            multilabel_loss_val_t = self.multilabel_loss_val_t[task_id] / float(self.task_step_val[task_id])
+            multilabel_loss_val_v = self.multilabel_loss_val_v[task_id] / float(self.task_step_val[task_id])
             lossInfo += "[%s]: masked_t %.3f masked_v %.3f NSP %.3f" % (
                 self.task_id2name[task_id],
                 masked_t_loss_val,
@@ -209,10 +265,18 @@ class tbLogger(object):
             self.linePlot(self.epochId, masked_t_loss_val, "val", self.task_id2name[task_id] + "_mask_t")
             self.linePlot(self.epochId, masked_v_loss_val, "val", self.task_id2name[task_id] + "_maks_v")
             self.linePlot(self.epochId, next_sentense_loss_val, "val", self.task_id2name[task_id] + "_nsp")
+            self.linePlot(self.epochId, discriminator_loss_val_t, "val", self.task_id2name[task_id] + "_disc_loss_t")
+            self.linePlot(self.epochId, discriminator_loss_val_v, "val", self.task_id2name[task_id] + "_disc_loss_v")
+            self.linePlot(self.epochId, multilabel_loss_val_t, "val", self.task_id2name[task_id] + "_multilabel_loss_t")
+            self.linePlot(self.epochId, multilabel_loss_val_v, "val", self.task_id2name[task_id] + "_multilabel_loss_v")
 
         self.masked_t_loss_val = {task_id: 0 for task_id in self.masked_t_loss_val}
         self.masked_v_loss_val = {task_id: 0 for task_id in self.masked_v_loss_val}
         self.next_sentense_loss_val = {task_id: 0 for task_id in self.next_sentense_loss_val}
+        self.discriminator_loss_val_t = {task_id: 0 for task_id in self.discriminator_loss_val_t}
+        self.discriminator_loss_val_v = {task_id: 0 for task_id in self.discriminator_loss_val_v}
+        self.multilabel_loss_val_t = {task_id: 0 for task_id in self.multilabel_loss_val_t}
+        self.multilabel_loss_val_v = {task_id: 0 for task_id in self.multilabel_loss_val_v}
         self.task_datasize_val = {task_id: 0 for task_id in self.task_datasize_val}
         self.task_step_val = {task_id: 0 for task_id in self.task_ids}
 
@@ -226,7 +290,9 @@ class tbLogger(object):
             if self.task_num_iters[task_id] > 0:
                 if self.task_step_tmp[task_id]:
                     lossInfo += (
-                        "[%s]: iter %d Ep: %.2f masked_t %.3f masked_v %.3f NSP %.3f lr %.6g"
+                        "[%s]: iter %d Ep: %.2f masked_t %.3f masked_v %.3f NSP %.3f lr %.6g disc_t %.3f disc_v %.3f "
+                        "ml_loss_t: %.3f ml_loss_v: %.3f "
+                        "conf_disc_t %.3f conf_disc_v %.3f"
                         % (
                             self.task_id2name[task_id], self.task_step[task_id],
                             self.task_step[task_id] / float(self.task_num_iters[task_id]),
@@ -234,6 +300,12 @@ class tbLogger(object):
                             self.masked_v_loss[task_id] / float(self.task_step_tmp[task_id]),
                             self.next_sentense_loss[task_id] / float(self.task_step_tmp[task_id]),
                             self.task_norm_tmp[task_id] / float(self.task_step_tmp[task_id]),
+                            self.discriminator_loss_t[task_id] / float(self.task_step_tmp[task_id]),
+                            self.discriminator_loss_v[task_id] / float(self.task_step_tmp[task_id]),
+                            self.multilabel_loss_t[task_id] / float(self.task_step_tmp[task_id]),
+                            self.multilabel_loss_v[task_id] / float(self.task_step_tmp[task_id]),
+                            self.conf_discriminator_loss_t[task_id] / float(self.task_step_tmp[task_id]),
+                            self.conf_discriminator_loss_v[task_id] / float(self.task_step_tmp[task_id]),
                         )
                     )
 
@@ -244,6 +316,13 @@ class tbLogger(object):
         self.masked_t_loss = {task_id: 0 for task_id in self.task_ids}
         self.masked_v_loss = {task_id: 0 for task_id in self.task_ids}
         self.next_sentense_loss = {task_id: 0 for task_id in self.task_ids}
+        self.discriminator_loss_t = {task_id: 0 for task_id in self.task_ids}
+        self.discriminator_loss_v = {task_id: 0 for task_id in self.task_ids}
+        self.multilabel_loss_t = {task_id: 0 for task_id in self.task_ids}
+        self.multilabel_loss_v = {task_id: 0 for task_id in self.task_ids}
+        self.conf_discriminator_loss_t = {task_id: 0 for task_id in self.task_ids}
+        self.conf_discriminator_loss_v = {task_id: 0 for task_id in self.task_ids}
+
         self.task_norm_tmp = {task_id: 0 for task_id in self.task_ids}
 
 
@@ -330,7 +409,7 @@ def resume(path, model, optimizer, scheduler, tb_logger):
             else:
                 new_dict[attr] = checkpoint["model_state_dict"][attr]
         model.load_state_dict(new_dict)
-        scheduler.load_state_dict(checkpoint.get("scheduler_state_dict", checkpoint["warmup_scheduler_state_dict"]))
+        scheduler.load_state_dict(checkpoint.get("scheduler_state_dict", checkpoint["scheduler_state_dict"]))
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         global_step = checkpoint["global_step"]
         start_epoch = int(checkpoint["epoch_id"]) + 1

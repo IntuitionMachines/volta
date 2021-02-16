@@ -457,8 +457,79 @@ class UniterEmbeddings(nn.Module):
         return embeddings, v_embeddings
 
 
+class MixUniterEmbeddings(nn.Module):
+    """Construct the embeddings from word, position, token_type embeddings and visual embeddings.
+    """
+    def __init__(self, config):
+        super(MixUniterEmbeddings, self).__init__()
+
+        self.hidden_size = config.hidden_size
+        self.initializer_range = config.initializer_range
+
+        self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=0)
+        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
+
+        # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
+        # any TensorFlow checkpoint file
+        self.LayerNorm = BertLayerNorm(config.hidden_size, eps=1e-12)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+        self.image_embeddings = nn.Linear(config.v_feature_size, config.v_hidden_size)
+        self.image_location_embeddings = nn.Linear(config.num_locs, config.v_hidden_size)
+        self.image_layer_norm = BertLayerNorm(config.hidden_size, eps=1e-12)
+        self.image_location_layer_norm = BertLayerNorm(config.hidden_size, eps=1e-12)
+
+        self.v_LayerNorm = BertLayerNorm(config.hidden_size, eps=1e-12)
+        self.v_dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.special_initialize()
+
+    def special_initialize(self):
+        # This function is used to init v_LayerNorm as LayerNorm
+        self.v_LayerNorm.weight = torch.nn.Parameter(copy.deepcopy(self.LayerNorm.weight.data), requires_grad=True)
+        self.v_LayerNorm.bias = torch.nn.Parameter(copy.deepcopy(self.LayerNorm.bias.data), requires_grad=True)
+
+    def textual_embeddings(self, token_ids, token_type_ids):
+        # textual embeddings
+        seq_length = token_ids.size(1)
+        position_ids = torch.arange(seq_length, dtype=torch.long, device=token_ids.device)
+        position_ids = position_ids.unsqueeze(0).expand_as(token_ids)
+        if token_type_ids is None:
+            token_type_ids = torch.zeros_like(token_ids)
+
+        words_embeddings = self.word_embeddings(token_ids)
+        position_embeddings = self.position_embeddings(position_ids)
+        token_type_embeddings = self.token_type_embeddings(token_type_ids)
+        embeddings = words_embeddings + position_embeddings + token_type_embeddings
+        embeddings = self.LayerNorm(embeddings)
+        embeddings = self.dropout(embeddings)
+
+        return embeddings
+
+    def visual_embeddings(self, image_feat, image_loc):
+        # visual embeddings
+        batch_size, num_boxes, _ = image_feat.shape
+        img_embeddings = self.image_layer_norm(self.image_embeddings(image_feat))
+        loc_embeddings = self.image_location_layer_norm(self.image_location_embeddings(image_loc))
+        img_type_ids = torch.ones_like(image_feat[:, :, 0].long())
+        v_token_type_embeddings = self.token_type_embeddings(img_type_ids)
+        v_embeddings = img_embeddings + loc_embeddings + v_token_type_embeddings
+        v_embeddings = self.v_LayerNorm(v_embeddings)
+        v_embeddings = self.v_dropout(v_embeddings)
+
+        return v_embeddings
+
+    def forward(self, input_type, **kwargs):
+        if input_type == 'visual':
+            return self.visual_embeddings(**kwargs)
+        elif input_type == 'textual':
+            return self.textual_embeddings(**kwargs)
+        else:
+            raise NotImplementedError
+
 shared_embeddings = {
     "vl-bert": VLBertEmbeddings,
     "visualbert": VisualBertEmbeddings,
     "uniter": UniterEmbeddings,
+    "mix_uniter": MixUniterEmbeddings,
 }

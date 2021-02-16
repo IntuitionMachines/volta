@@ -25,9 +25,11 @@ class BertConfig(object):
         max_position_embeddings=512,
         type_vocab_size=2,
         num_locs=5,
+        visual_target_categories_file="config/visual_genome_categories.json",
         v_coordinate_embeddings_dim=None,
         add_global_imgfeat=None,
         image_embeddings="vilbert",
+        v_use_language_prototypes=False,
         initializer_range=0.02,
         v_feature_size=2048,
         v_hidden_size=768,
@@ -109,7 +111,9 @@ class BertConfig(object):
             self.num_locs = num_locs
             self.v_coordinate_embeddings_dim = v_coordinate_embeddings_dim
             self.add_global_imgfeat = add_global_imgfeat
+            self.visual_target_categories_file = visual_target_categories_file
             self.image_embeddings = image_embeddings
+            self.v_use_language_prototypes = v_use_language_prototypes
             self.v_feature_size = v_feature_size
             self.v_hidden_size = v_hidden_size
             self.v_num_attention_heads = v_num_attention_heads

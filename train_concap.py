@@ -7,13 +7,17 @@
 import os
 import sys
 import json
+import time
+import datetime
 import random
 import logging
 import argparse
+import gc
 from io import open
 
 import numpy as np
 
+from tqdm import tqdm
 import torch
 import torch.distributed as dist
 
@@ -21,7 +25,6 @@ from pytorch_transformers.tokenization_bert import BertTokenizer
 from pytorch_transformers.optimization import AdamW, WarmupLinearSchedule
 
 from volta.config import BertConfig
-from volta.encoders import BertForVLPreTraining
 from volta.datasets import ConceptCapLoaderTrain, ConceptCapLoaderVal
 from volta.train_utils import freeze_layers, tbLogger, summary_parameters, save, resume
 
@@ -32,7 +35,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -94,7 +96,15 @@ def parse_args():
                         help="Which objective to use \n"
                              "0: with ITM loss, \n"
                              "1: with ITM loss; for the not aligned pair, no masking objective, \n"
-                             "2: without ITM loss, do not sample negative pair.")
+                             "2: without ITM loss, do not sample negative pair, \n"
+                             "3: without ITM loss, but still sample both positive and negative pairs, domain confusion \n"
+                             "4: without ITM loss, ALWAYS sample negative pairs, domain confusion")
+    parser.add_argument("--add_multi_label_loss_t", action="store_true")
+    parser.add_argument("--add_multi_label_loss_v", action="store_true")
+    # UDA Training Specifics
+    parser.add_argument("--freeze_bert", action="store_true",
+                        help="whether freeze bert when training generator")
+
     # Optimizer
     parser.add_argument("--adam_epsilon", default=1e-8, type=float,
                         help="Epsilon for Adam optimizer.")
@@ -131,9 +141,11 @@ def main():
 
     # Load config
     config = BertConfig.from_json_file(args.config_file)
+    config.objective = args.objective
 
     # Output dirs
-    timestamp = args.config_file.split("/")[1].split(".")[0]
+    now = datetime.datetime.fromtimestamp(time.time()).strftime('-%Y-%m%d-%H-%M')
+    timestamp = args.config_file.split("/")[1].split(".")[0] + now
     save_path = os.path.join(args.output_dir, timestamp)
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
@@ -167,11 +179,13 @@ def main():
                                           seq_len=args.max_seq_length, batch_size=args.train_batch_size,
                                           num_workers=args.num_workers, local_rank=args.local_rank,
                                           objective=args.objective, cache=cache,
-                                          add_global_imgfeat=config.add_global_imgfeat, num_locs=config.num_locs)
+                                          add_global_imgfeat=config.add_global_imgfeat, num_locs=config.num_locs,
+                                          visual_target_categories_file=config.visual_target_categories_file)
     valid_dataset = ConceptCapLoaderVal(args.annotations_path, args.features_path, tokenizer, args.bert_model,
                                         seq_len=args.max_seq_length, batch_size=args.train_batch_size, num_workers=2,
                                         objective=args.objective, add_global_imgfeat=config.add_global_imgfeat,
-                                        num_locs=config.num_locs)
+                                        num_locs=config.num_locs,
+                                        visual_target_categories_file=config.visual_target_categories_file)
 
     # Task details
     task_names = ["Conceptual_Caption"]
@@ -184,6 +198,11 @@ def main():
         tb_logger = tbLogger(logdir, save_path, task_names, task_ids, task2num_iters, args.grad_acc_steps)
 
     # Model
+    if config.image_embeddings == 'mix_uniter':
+        from volta.encoders_mm import BertForVLPreTraining
+    else:
+        from volta.encoders import BertForVLPreTraining
+
     if args.from_pretrained:
         type_vocab_size = config.type_vocab_size
         config.type_vocab_size = 2
@@ -255,7 +274,7 @@ def main():
         model = torch.nn.DataParallel(model)
 
     # Save starting model
-    save(save_path, logger, -1, model, optimizer, scheduler, global_step, tb_logger, default_gpu)
+    #save(save_path, logger, -1, model, optimizer, scheduler, global_step, tb_logger, default_gpu)
 
     # Print summary
     if default_gpu:
@@ -265,93 +284,226 @@ def main():
         logger.info("  Batch size = %d", args.train_batch_size)
         logger.info("  Num steps = %d", num_train_optimization_steps)
 
+    if args.objective == 3 or args.objective == 4:
+        add_domain_confusion_loss = True
+        if isinstance(model, torch.nn.DataParallel):
+            model.module.update_v_prototypes((train_dataset.preprocess_function.vis_category_to_tokenIds,
+                                              train_dataset.preprocess_function.vis_att_category_to_tokenIds))
+        else:
+            model.update_v_prototypes((train_dataset.preprocess_function.vis_category_to_tokenIds,
+                                       train_dataset.preprocess_function.vis_att_category_to_tokenIds))
     # Train
-    for epoch_id in range(start_epoch, int(args.num_train_epochs)):
+    for epoch_id in tqdm(range(start_epoch, int(args.num_train_epochs))):
         model.train()
-        for step, batch in enumerate(train_dataset):
+        prev_batches = []
+        for step, batch in tqdm(enumerate(train_dataset)):
             iter_id = start_iter_id + step + (epoch_id * len(train_dataset))
-            batch = tuple(t.cuda(device=device, non_blocking=True) for t in batch[:-1])
+            batch = tuple(torch.tensor(t, device=device) for t in batch[:-1])
+            #batch = tuple(t.cuda(device=device, non_blocking=True) for t in batch[:-1])
+            if len(batch) == 15:
+                input_ids, input_mask, segment_ids, lm_label_ids, is_match, \
+                image_feat, image_loc, image_cls, obj_labels, obj_confs, \
+                attr_labels, attr_confs, image_attrs, image_label, image_mask = batch
+            elif len(batch) == 17:
+                input_ids, input_mask, segment_ids, lm_label_ids, is_match, \
+                image_feat, image_loc, image_cls, obj_labels, obj_confs, \
+                attr_labels, attr_confs, image_attrs, image_label, image_mask, \
+                obj_tokens, attr_tokens = batch
+            else:
+                raise ValueError
 
-            input_ids, input_mask, segment_ids, lm_label_ids, is_match, \
-            image_feat, image_loc, image_cls, obj_labels, obj_confs, \
-            attr_labels, attr_confs, image_attrs, image_label, image_mask = batch
-
-            if args.objective == 1:
+            if args.objective == 1 or args.objective == 3 or args.objective == 4:
                 # Ignore labels (setting them to -1) for mismatched caption-image pairs
                 image_label = image_label * (is_match == 0).long().unsqueeze(1)
                 image_label[image_label == 0] = -1
                 lm_label_ids = lm_label_ids * (is_match == 0).long().unsqueeze(1)
                 lm_label_ids[lm_label_ids == 0] = -1
 
-            masked_loss_t, masked_loss_v, pair_match_loss = model(input_ids, image_feat, image_loc, segment_ids,
-                                                                  input_mask, image_mask, lm_label_ids, image_label,
-                                                                  image_cls, obj_labels, obj_confs, attr_labels,
-                                                                  attr_confs, image_attrs, is_match)
+            masked_loss_t, masked_loss_v, pair_match_loss, discriminator_loss_t, discriminator_loss_v, \
+            multilabel_loss_t, multilabel_loss_v = \
+                model(input_ids, image_feat, image_loc, segment_ids, input_mask, image_mask, lm_label_ids, image_label,
+                      image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs, is_match, False,
+                      add_domain_confusion_loss=add_domain_confusion_loss,
+                      add_multi_label_loss_t=args.add_multi_label_loss_t,
+                      add_multi_label_loss_v=args.add_multi_label_loss_v)
 
             if args.objective == 2:
                 pair_match_loss = pair_match_loss * 0
 
-            loss = masked_loss_t + masked_loss_v + pair_match_loss
+            if args.objective == 3 or args.objective == 4:
+                pair_match_loss = pair_match_loss.detach()
+                loss = masked_loss_t + masked_loss_v + discriminator_loss_t + discriminator_loss_v
+            else:
+                loss = masked_loss_t + masked_loss_v + pair_match_loss
+
+            if args.add_multi_label_loss_t:
+                loss += multilabel_loss_t
+
+            if args.add_multi_label_loss_v:
+                loss += multilabel_loss_v
+
             if n_gpu > 1:
                 loss = loss.mean()
                 masked_loss_t = masked_loss_t.mean()
                 masked_loss_v = masked_loss_v.mean()
                 pair_match_loss = pair_match_loss.mean()
+                if args.objective == 3 or args.objective == 4:
+                    discriminator_loss_t = discriminator_loss_t.mean()
+                    discriminator_loss_v = discriminator_loss_v.mean()
+                if args.add_multi_label_loss_t:
+                    multilabel_loss_t = multilabel_loss_t.mean()
+                if args.add_multi_label_loss_v:
+                    multilabel_loss_v = multilabel_loss_v.mean()
 
             if args.grad_acc_steps > 1:
                 loss = loss / args.grad_acc_steps
             loss.backward()
 
-            if (step + 1) % args.grad_acc_steps == 0:
+            if (step + 1) % args.grad_acc_steps != 0:
+                prev_batches.append(batch)
+            else:
                 # Clip gradient
                 if args.clip_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
 
                 optimizer.step()
-                scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
 
-                if default_gpu:
-                    tb_logger.step_train_CC(epoch_id, iter_id,
-                                            float(masked_loss_t), float(masked_loss_v), float(pair_match_loss),
-                                            optimizer.param_groups[0]["lr"], "TASK0", "train")
+                # Now it's time to confuse the discriminator
+                # discriminator's weights are to be frozen while the transformer encoders' are trained
+                conf_discriminator_loss_t, conf_discriminator_loss_v = 0, 0
+                if args.objective == 3 or args.objective == 4:
+                    if isinstance(model, torch.nn.DataParallel):
+                        model.module.update_v_prototypes((train_dataset.preprocess_function.vis_category_to_tokenIds,
+                                                          train_dataset.preprocess_function.vis_att_category_to_tokenIds))
+                    else:
+                        model.update_v_prototypes((train_dataset.preprocess_function.vis_category_to_tokenIds,
+                                                   train_dataset.preprocess_function.vis_att_category_to_tokenIds))
 
-            if (step % (20 * args.grad_acc_steps) == 0) and step != 0 and default_gpu:
+                    if isinstance(model, torch.nn.DataParallel):
+                        model.module.freeze_discriminator(args.freeze_bert)
+                    else:
+                        model.freeze_discriminator(args.freeze_bert)
+
+                    # accumulating gradients for previous batches (incl. current batch)
+                    prev_batches.append(batch)
+                    for prev_batch in prev_batches:
+                        input_ids, input_mask, segment_ids, lm_label_ids, is_match, \
+                        image_feat, image_loc, image_cls, obj_labels, obj_confs, \
+                        attr_labels, attr_confs, image_attrs, image_label, image_mask, \
+                        obj_tokens, attr_tokens = prev_batch
+
+                        # Ignore labels (setting them to -1) for mismatched caption-image pairs
+                        image_label = image_label * (is_match == 0).long().unsqueeze(1)
+                        image_label[image_label == 0] = -1
+                        lm_label_ids = lm_label_ids * (is_match == 0).long().unsqueeze(1)
+                        lm_label_ids[lm_label_ids == 0] = -1
+
+                        conf_discriminator_loss_t, conf_discriminator_loss_v = \
+                            model(input_ids, image_feat, image_loc, segment_ids, input_mask, image_mask, lm_label_ids,
+                                  image_label, image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs,
+                                  is_match, False, add_domain_confusion_loss=add_domain_confusion_loss,
+                                  confuse_discriminator_only=True)
+                        loss = conf_discriminator_loss_t + conf_discriminator_loss_v
+                        if n_gpu > 1:
+                            loss = loss.mean()
+                            conf_discriminator_loss_t = conf_discriminator_loss_t.mean()
+                            conf_discriminator_loss_v = conf_discriminator_loss_v.mean()
+
+                        loss.backward()
+
+                    if args.clip_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                    if isinstance(model, torch.nn.DataParallel):
+                        model.module.defreeze_discriminator(args.freeze_bert)
+                    else:
+                        model.defreeze_discriminator(args.freeze_bert)
+
+                if default_gpu:
+                    plotline = step % (20 * args.grad_acc_steps) == 0
+                    tb_logger.step_train_CC(epoch_id, iter_id,
+                                            masked_loss_t, masked_loss_v, pair_match_loss,
+                                            discriminator_loss_t, discriminator_loss_v,
+                                            conf_discriminator_loss_t, conf_discriminator_loss_v,
+                                            multilabel_loss_t, multilabel_loss_v,
+                                            optimizer.param_groups[0]["lr"], "TASK0", "train", plotline=plotline)
+
+                prev_batches = []
+                scheduler.step()
+
+            if (step % (100 * args.grad_acc_steps) == 0) and step != 0 and default_gpu:
                 tb_logger.showLossTrainCC()
 
         # Do the evaluation
         torch.set_grad_enabled(False)
         numBatches = len(valid_dataset)
         model.eval()
-        for step, batch in enumerate(valid_dataset):
+        for step, batch in tqdm(enumerate(valid_dataset)):
             batch = tuple(t.cuda(device=device, non_blocking=True) for t in batch[:-1])
-
-            input_ids, input_mask, segment_ids, lm_label_ids, is_match, \
-            image_feat, image_loc, image_cls, obj_labels, obj_confs, \
-            attr_labels, attr_confs, image_attrs, image_label, image_mask = batch
+            if len(batch) == 15:
+                input_ids, input_mask, segment_ids, lm_label_ids, is_match, \
+                image_feat, image_loc, image_cls, obj_labels, obj_confs, \
+                attr_labels, attr_confs, image_attrs, image_label, image_mask = batch
+            elif len(batch) == 17:
+                input_ids, input_mask, segment_ids, lm_label_ids, is_match, \
+                image_feat, image_loc, image_cls, obj_labels, obj_confs, \
+                attr_labels, attr_confs, image_attrs, image_label, image_mask, \
+                obj_tokens, attr_tokens = batch
+            else:
+                raise ValueError
 
             batch_size = input_ids.size(0)
-            masked_loss_t, masked_loss_v, pair_match_loss = model(input_ids, image_feat, image_loc, segment_ids,
-                                                                  input_mask, image_mask, lm_label_ids, image_label,
-                                                                  image_cls, obj_labels, obj_confs, attr_labels,
-                                                                  attr_confs, image_attrs, is_match)
+            masked_loss_t, masked_loss_v, pair_match_loss, discriminator_loss_t, discriminator_loss_v,\
+                multilabel_loss_t, multilabel_loss_v = \
+                model(input_ids, image_feat, image_loc, segment_ids, input_mask, image_mask, lm_label_ids, image_label,
+                      image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs, is_match,
+                      add_multi_label_loss_t=args.add_multi_label_loss_t,
+                      add_multi_label_loss_v=args.add_multi_label_loss_v,
+                      add_domain_confusion_loss=add_domain_confusion_loss)
 
-            loss = masked_loss_t + masked_loss_v + pair_match_loss
+            if args.objective == 3 or args.objective == 4:
+                pair_match_loss = pair_match_loss.detach()
+                loss = masked_loss_t + masked_loss_v + discriminator_loss_t + discriminator_loss_v
+            else:
+                loss = masked_loss_t + masked_loss_v + pair_match_loss
+
+            if args.add_multi_label_loss_t:
+                loss += multilabel_loss_t
+
+            if args.add_multi_label_loss_v:
+                loss += multilabel_loss_v
+
             if n_gpu > 1:
                 loss = loss.mean()
                 masked_loss_t = masked_loss_t.mean()
                 masked_loss_v = masked_loss_v.mean()
                 pair_match_loss = pair_match_loss.mean()
+                if args.objective == 3 or args.objective == 4:
+                    discriminator_loss_t = discriminator_loss_t.mean()
+                    discriminator_loss_v = discriminator_loss_v.mean()
+                if args.add_multi_label_loss_t:
+                    multilabel_loss_t = multilabel_loss_t.mean()
+                if args.add_multi_label_loss_v:
+                    multilabel_loss_v = multilabel_loss_v.mean()
 
             if default_gpu:
                 tb_logger.step_val_CC(epoch_id, float(masked_loss_t), float(masked_loss_v), float(pair_match_loss),
+                                      float(discriminator_loss_t), float(discriminator_loss_v),
+                                      float(multilabel_loss_t), float(multilabel_loss_v),
                                       "TASK0", batch_size, "val")
                 sys.stdout.write("%d / %d \r" % (step, numBatches))
                 sys.stdout.flush()
 
+        if default_gpu:
+            tb_logger.showLossValCC()
+
         torch.set_grad_enabled(True)
         save(save_path, logger, epoch_id, model, optimizer, scheduler, global_step, tb_logger, default_gpu)
+        gc.collect()
 
     if default_gpu:
         tb_logger.txt_close()
