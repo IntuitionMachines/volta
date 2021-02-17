@@ -249,14 +249,14 @@ def ForwardModelsTrain(config, task_cfg, device, task_id, batch, model, criterio
         vil_logit = vil_prediction.view(batch_size, num_options)
         loss = criterion(vil_logit, target)
         _, preds = torch.max(vil_logit, 1)
-        batch_score = float((preds == target).sum()) / float(batch_size)
+        batch_score = (preds == target).sum() / float(batch_size)
 
     elif task_cfg[task_id]["type"] == "V-logit":
         loss = criterion(vil_prediction, target)
         loss = loss.mean() * target.size(1)
         _, select_idx = torch.max(vil_prediction, dim=1)
         select_target = target.squeeze(2).gather(1, select_idx.view(-1, 1))
-        batch_score = float(torch.sum(select_target > 0.5)) / batch_size
+        batch_score = torch.sum(select_target > 0.5) / float(batch_size)
 
     elif task_cfg[task_id]["type"] == "V-logit-mc":
         vision_logit = vil_prediction[:, 101:]  # FIXME from ViLBERT
@@ -266,7 +266,7 @@ def ForwardModelsTrain(config, task_cfg, device, task_id, batch, model, criterio
         loss = loss.mean() * target.size(1)
         _, preds = torch.max(vision_logit, dim=1)
         _, target = torch.max(target, dim=1)
-        batch_score = float((preds == target).sum()) / float(batch_size)
+        batch_score = (preds == target).sum() / float(batch_size)
 
     elif task_cfg[task_id]["type"] == "VL-binary-classifier":
         loss = criterion(vil_prediction, target)
@@ -370,10 +370,63 @@ def LoadDataset(args, config, task_cfg, task_id, split="trainval"):
 
     return batch_size, task2num_iters, dset_train, dset_val, dl_train, dl_val
 
+def LoadDatasetEval(args, config, task_cfg, task_id):
+    if "roberta" in args.bert_model:
+        tokenizer = RobertaTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
+    else:
+        tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
+
+    task = "TASK" + task_id
+    task_name = task_cfg[task]["name"]
+
+    # initialize the feature reader
+    feats_h5path1 = task_cfg[task]["features_h5path1"]
+    feats_h5path2 = task_cfg[task]["features_h5path2"]
+    features_reader1 = ImageFeaturesH5Reader(feats_h5path1, config, args.in_memory) if feats_h5path1 != "" else None
+    features_reader2 = ImageFeaturesH5Reader(feats_h5path2, config, args.in_memory) if feats_h5path2 != "" else None
+
+    batch_size = task_cfg[task].get("eval_batch_size", args.batch_size)
+    if args.local_rank != -1:
+        batch_size = int(batch_size / dist.get_world_size())
+
+    logger.info("Loading %s Dataset with batch size %d" % (task_name, batch_size))
+    if args.split:
+        eval_split = args.split
+    else:
+        eval_split = task_cfg[task]["val_split"]
+
+    dset_val = DatasetMapEval[task_name](
+        task=task_cfg[task]["name"],
+        dataroot=task_cfg[task]["dataroot"],
+        annotations_jsonpath=task_cfg[task]["val_annotations_jsonpath"],
+        split=eval_split,
+        image_features_reader=features_reader1,
+        gt_image_features_reader=features_reader2,
+        tokenizer=tokenizer,
+        bert_model=args.bert_model,
+        padding_index=0,
+        max_seq_length=task_cfg[task]["max_seq_length"],
+        max_region_num=task_cfg[task]["max_region_num"],
+        num_locs=config.num_locs,
+        add_global_imgfeat=config.add_global_imgfeat,
+        append_mask_sep=(config.fusion_method == 'vl-bert_vqa'),
+    )
+
+    dl_val = DataLoader(
+        dset_val,
+        shuffle=False,
+        batch_size=batch_size,
+        num_workers=10,
+        pin_memory=True,
+        drop_last=args.drop_last,
+    )
+    task2num_iters = {task: len(dl_val)}
+
+    return batch_size, task2num_iters, dset_val, dl_val
 
 def compute_score_with_logits(logits, labels):
     logits = torch.max(logits, 1)[1].data  # argmax
-    one_hots = torch.zeros(*labels.size()).cuda()
+    one_hots = torch.zeros(*labels.size(), device=logits)
     one_hots.scatter_(1, logits.view(-1, 1), 1)
     scores = one_hots * labels
     return scores
@@ -545,7 +598,7 @@ def EvaluatingModel(config, task_cfg, device, task_id, batch, model, dataloader,
         loss = loss.mean() * target.size(1)
         _, preds = torch.max(vision_logit, dim=1)
         _, target = torch.max(target, dim=1)
-        batch_score = float((preds == target).sum())
+        batch_score = (preds == target).sum()
 
         for i in range(preds.size(0)):
             results.append({"id": question_id[i].item(), "target": preds[i].item()})
@@ -560,4 +613,4 @@ def EvaluatingModel(config, task_cfg, device, task_id, batch, model, dataloader,
         loss = loss.mean()
         batch_score = compute_score_with_logits(vil_prediction, target).sum()
 
-    return float(loss), float(batch_score), batch_size, results, others
+    return loss, batch_score, batch_size, results, others

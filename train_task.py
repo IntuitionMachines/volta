@@ -7,6 +7,8 @@
 import os
 import sys
 import json
+import time
+import datetime
 import yaml
 import random
 import logging
@@ -25,7 +27,6 @@ from pytorch_transformers.optimization import AdamW, WarmupConstantSchedule, War
 
 from volta.config import BertConfig
 from volta.optimization import RAdam
-from volta.encoders import BertForVLTasks
 from volta.train_utils import freeze_layers, tbLogger, summary_parameters, save, resume
 from volta.task_utils import LoadDataset, LoadLoss, ForwardModelsTrain, ForwardModelsVal
 
@@ -146,11 +147,12 @@ def main():
         config.fusion_method = task_cfg[task]["fusion_method"]
 
     # Output dirs
+    now = datetime.datetime.fromtimestamp(time.time()).strftime('-%Y-%m%d-%H-%M')
     if args.save_name:
         prefix = "-" + args.save_name
     else:
         prefix = ""
-    timestamp = (task_name + "_" + args.config_file.split("/")[1].split(".")[0] + prefix)
+    timestamp = (task_name + "_" + args.config_file.split("/")[1].split(".")[0] + prefix + now)
     save_path = os.path.join(args.output_dir, timestamp)
     if default_gpu:
         if not os.path.exists(save_path):
@@ -176,6 +178,11 @@ def main():
         os.makedirs(args.output_dir)
 
     # Model
+    if config.image_embeddings == 'mix_uniter':
+        from volta.encoders_mm import BertForVLTasks
+    else:
+        from volta.encoders import BertForVLTasks
+
     if "roberta" in args.bert_model:
         config.model = "roberta"
     model = BertForVLTasks.from_pretrained(args.from_pretrained, config=config, task_cfg=task_cfg, task_ids=[task])
@@ -268,8 +275,9 @@ def main():
     # Train
     for epoch_id in tqdm(range(start_epoch, args.num_train_epochs), desc="Epoch"):
         model.train()
+        len_dl_train = len(dl_train)
         for step, batch in tqdm(enumerate(dl_train)):
-            iter_id = start_iter_id + step + (epoch_id * len(dl_train))
+            iter_id = start_iter_id + step + (epoch_id * len_dl_train)
 
             loss, score = ForwardModelsTrain(config, task_cfg, device, task, batch, model, criterion)
             if args.grad_acc_steps > 1:
@@ -289,19 +297,18 @@ def main():
                 global_step += 1
 
                 if default_gpu:
-                    tb_logger.step_train(epoch_id, iter_id, float(loss), float(score),
-                                         optimizer.param_groups[0]["lr"], task, "train")
+                    plotline = step % (20 * args.grad_acc_steps) == 0
+                    tb_logger.step_train(epoch_id, iter_id, loss, score,
+                                         optimizer.param_groups[0]["lr"], task, "train", plotline=plotline)
 
-            if (step % (20 * args.grad_acc_steps) == 0) and step != 0 and default_gpu:
+            if (step % (100 * args.grad_acc_steps) == 0) and step != 0 and default_gpu:
                 tb_logger.showLossTrain()
 
-            # Decide whether to evaluate task
-            if iter_id != 0 and iter_id % task2num_iters[task] == 0:
-                score = evaluate(config, dl_val, task_cfg, device, task, model, criterion, epoch_id, default_gpu, tb_logger)
-                if score > max_score:
-                    max_score = score
-                    save(save_path, logger, epoch_id, model, optimizer, scheduler,
-                         global_step, tb_logger, default_gpu, max_score)
+        score = evaluate(config, dl_val, task_cfg, device, task, model, criterion, epoch_id, default_gpu, tb_logger)
+        if score > max_score:
+            max_score = score
+            save(save_path, logger, epoch_id, model, optimizer, scheduler,
+                 global_step, tb_logger, default_gpu, max_score)
 
         save(save_path, logger, epoch_id, model, optimizer, scheduler, global_step, tb_logger, default_gpu, max_score)
 
@@ -312,7 +319,7 @@ def evaluate(config, dataloader_val, task_cfg, device, task_id, model, criterion
     model.eval()
     for i, batch in enumerate(dataloader_val):
         loss, score, batch_size = ForwardModelsVal(config, task_cfg, device, task_id, batch, model, criterion)
-        tb_logger.step_val(epoch_id, float(loss), float(score), task_id, batch_size, "val")
+        tb_logger.step_val(epoch_id, loss, score, task_id, batch_size, "val")
         if default_gpu:
             sys.stdout.write("%d/%d\r" % (i, len(dataloader_val)))
             sys.stdout.flush()

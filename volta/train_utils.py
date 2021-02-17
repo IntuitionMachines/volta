@@ -92,7 +92,11 @@ class tbLogger(object):
         if self.save_logger:
             self.logger.add_scalar(split + "/" + key, val, step)
 
-    def step_train(self, epochId, stepId, loss, score, norm, task_id, split):
+    def step_train(self, epochId, stepId, loss, score, norm, task_id, split, plotline=True):
+        loss = self._detach_or_return_zero(loss)
+        score = self._detach_or_return_zero(score)
+        norm = self._detach_or_return_zero(norm)
+
         self.task_loss[task_id] += loss
         self.task_loss_tmp[task_id] += loss
         self.task_score_tmp[task_id] += score
@@ -102,9 +106,10 @@ class tbLogger(object):
         self.epochId = epochId
 
         # plot on tensorboard.
-        self.linePlot(stepId, loss, split, self.task_id2name[task_id] + "_loss")
-        self.linePlot(stepId, score, split, self.task_id2name[task_id] + "_score")
-        self.linePlot(stepId, norm, split, self.task_id2name[task_id] + "_norm")
+        if plotline:
+            self.linePlot(stepId, loss, split, self.task_id2name[task_id] + "_loss")
+            self.linePlot(stepId, score, split, self.task_id2name[task_id] + "_score")
+            self.linePlot(stepId, norm, split, self.task_id2name[task_id] + "_norm")
 
     def step_train_CC(self, epochId, stepId, masked_loss_t, masked_loss_v, next_sentence_loss,
                       discriminator_loss_t, discriminator_loss_v,
@@ -149,6 +154,8 @@ class tbLogger(object):
 
 
     def step_val(self, epochId, loss, score, task_id, batch_size, split):
+        loss = self._detach_or_return_zero(loss)
+        score = self._detach_or_return_zero(score)
         self.task_loss_val[task_id] += loss * batch_size
         self.task_score_val[task_id] += score
         self.task_step_val[task_id] += self.gradient_accumulation_steps

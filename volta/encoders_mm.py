@@ -1220,7 +1220,7 @@ class BertForVLPreTraining(BertPreTrainedModel):
                       image_attention_mask=image_attention_mask,
                       output_all_encoded_layers=False,
                       output_all_attention_masks=output_all_attention_masks)
-        _, sequence_output_v, _, pooled_output_v, _ = self.v_forward('visual', **kwargs)
+        _, sequence_output_v, _, pooled_output_v, (_, all_attention_mask_v) = self.v_forward('visual', **kwargs)
 
         # feed language part
         kwargs = dict(input_txt=input_ids,
@@ -1228,7 +1228,8 @@ class BertForVLPreTraining(BertPreTrainedModel):
                       attention_mask=attention_mask,
                       output_all_encoded_layers=False,
                       output_all_attention_masks=output_all_attention_masks)
-        sequence_output_t, _, pooled_output_t, _, _ = self.t_forward('textual', **kwargs)
+        sequence_output_t, _, pooled_output_t, _, (all_attention_mask_t, _) = self.t_forward('textual', **kwargs)
+        all_attention_mask = (all_attention_mask_t, all_attention_mask_v)
 
         cls_outputs = self.cls(sequence_output_t, sequence_output_v, pooled_output_t, pooled_output_v,
                                add_domain_confusion_loss, confuse_discriminator_only)
@@ -1365,6 +1366,12 @@ class BertForVLTasks(BertPreTrainedModel):
         self.fusion_method = config.fusion_method
         self.apply(self.init_weights)
 
+    def t_forward(self, input_type, **kwargs):
+        return self.bert(input_type, **kwargs)
+
+    def v_forward(self, input_type, **kwargs):
+        return self.bert(input_type, **kwargs)
+
     def forward(
         self,
         input_txt,
@@ -1378,7 +1385,26 @@ class BertForVLTasks(BertPreTrainedModel):
         output_all_attention_masks=False,
     ):
 
-        sequence_output_t, sequence_output_v, pooled_output_t, pooled_output_v, all_attention_mask = self.bert(
+        #####################################
+        # separately feed visual and language inputs to the same model
+        # feed visual part
+        kwargs = dict(input_imgs=input_imgs,
+                      image_loc=image_loc,
+                      image_attention_mask=image_attention_mask,
+                      output_all_encoded_layers=output_all_encoded_layers,
+                      output_all_attention_masks=output_all_attention_masks)
+        _, sequence_output_v, _, pooled_output_v, (_, all_attention_mask_v) = self.v_forward('visual', **kwargs)
+
+        # feed language part
+        kwargs = dict(input_txt=input_txt,
+                      token_type_ids=token_type_ids,
+                      attention_mask=attention_mask,
+                      output_all_encoded_layers=output_all_encoded_layers,
+                      output_all_attention_masks=output_all_attention_masks)
+        sequence_output_t, _, pooled_output_t, _, (all_attention_mask_t, _) = self.t_forward('textual', **kwargs)
+        all_attention_mask = (all_attention_mask_t, all_attention_mask_v)
+        #####################################
+        '''sequence_output_t, sequence_output_v, pooled_output_t, pooled_output_v, all_attention_mask = self.bert(
             input_txt,
             input_imgs,
             image_loc,
@@ -1387,7 +1413,7 @@ class BertForVLTasks(BertPreTrainedModel):
             image_attention_mask,
             output_all_encoded_layers=output_all_encoded_layers,
             output_all_attention_masks=output_all_attention_masks,
-        )
+        )'''
 
         linguisic_prediction, vision_prediction = None, None
 

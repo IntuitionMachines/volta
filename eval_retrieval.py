@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.distributed as dist
 
 from volta.config import BertConfig
-from volta.encoders import BertForVLTasks, BertForVLPreTraining
+#from volta.encoders import BertForVLTasks, BertForVLPreTraining
 from volta.task_utils import LoadDatasetEval, LoadLoss, ForwardModelsTrain, ForwardModelsVal
 
 
@@ -131,6 +131,11 @@ def main():
     batch_size, task2num_iters, dset_val, dl_val = LoadDatasetEval(args, config, task_cfg, args.task)
 
     # Model
+    if config.image_embeddings == 'mix_uniter':
+        from volta.encoders_mm import BertForVLTasks, BertForVLPreTraining
+    else:
+        from volta.encoders import BertForVLTasks, BertForVLPreTraining
+
     if args.zero_shot:
         config.visual_target_weights = [0, 0, 0, 0, 0, 0, 0]
         model = BertForVLPreTraining.from_pretrained(args.from_pretrained, config=config)
