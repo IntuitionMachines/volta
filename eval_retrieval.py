@@ -193,7 +193,7 @@ def main():
                 ] = (target.view(-1).float().cpu().numpy())
 
             else:
-                vil_logit, _, _, _ = model(question, features, spatials, task, segment_ids, input_mask, image_mask)
+                vil_logit, _, _, _, _, _ = model(question, features, spatials, task, segment_ids, input_mask, image_mask)
 
                 score_matrix[
                     caption_idx, image_idx * 500: (image_idx + 1) * 500

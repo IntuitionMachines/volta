@@ -623,13 +623,19 @@ class BertTextPooler(nn.Module):
     def __init__(self, config):
         super(BertTextPooler, self).__init__()
         self.dense = nn.Linear(config.hidden_size, config.pooler_size)
-        self.activation = nn.ReLU()
+        if config.pooler_act == 'relu':
+            self.activation = nn.ReLU()
+        elif config.pooler_act == 'gelu':
+            self.activation = GeLU()
+        elif config.pooler_act == 'none':
+            self.activation = None
 
     def forward(self, hidden_states):
         # We "pool" the model by simply taking the hidden state corresponding to the first token.
         first_token_tensor = hidden_states[:, 0]
         pooled_output = self.dense(first_token_tensor)
-        pooled_output = self.activation(pooled_output)
+        if self.activation:
+            pooled_output = self.activation(pooled_output)
         return pooled_output
 
 
@@ -637,7 +643,12 @@ class VLBertTextPooler(nn.Module):
     def __init__(self, config):
         super(VLBertTextPooler, self).__init__()
         self.dense = nn.Linear(config.hidden_size, config.pooler_size)
-        self.activation = nn.ReLU()
+        if config.pooler_act == 'relu':
+            self.activation = nn.ReLU()
+        elif config.pooler_act == 'gelu':
+            self.activation = GeLU()
+        elif config.pooler_act == 'none':
+            self.activation = None
 
     def forward(self, hidden_states, text_end):
         # We "pool" the model by simply taking the hidden state corresponding to the first token.
@@ -645,7 +656,8 @@ class VLBertTextPooler(nn.Module):
                                      torch.arange(hidden_states.size(1), dtype=torch.long, device=hidden_states.device))
         mask_token_tensor = hidden_states[(grid_pos == text_end - 2)]
         pooled_output = self.dense(mask_token_tensor)
-        pooled_output = self.activation(pooled_output)
+        if self.activation:
+            pooled_output = self.activation(pooled_output)
         return pooled_output
 
 
@@ -653,13 +665,19 @@ class BertImagePooler(nn.Module):
     def __init__(self, config):
         super(BertImagePooler, self).__init__()
         self.dense = nn.Linear(config.v_hidden_size, config.v_pooler_size)
-        self.activation = nn.ReLU()
+        if config.pooler_act == 'relu':
+            self.activation = nn.ReLU()
+        elif config.pooler_act == 'gelu':
+            self.activation = GeLU()
+        elif config.pooler_act == 'none':
+            self.activation = None
 
     def forward(self, hidden_states):
         # We "pool" the model by simply taking the hidden state corresponding to the first token.
         first_token_tensor = hidden_states[:, 0]
         pooled_output = self.dense(first_token_tensor)
-        pooled_output = self.activation(pooled_output)
+        if self.activation:
+            pooled_output = self.activation(pooled_output)
         return pooled_output
 
 
@@ -774,10 +792,13 @@ class BertImagePredictionHead(nn.Module):
 class Discriminator(nn.Module):
     def __init__(self, config):
         super(Discriminator, self).__init__()
-        self.dense1 = nn.Linear(config.v_hidden_size, config.v_hidden_size)
+        #self.dense1 = nn.Linear(config.v_hidden_size, config.v_hidden_size)
+        self.dense1 = nn.Linear(config.v_pooler_size, config.v_pooler_size)
         self.v_intermediate_act_fn = ACT2FN[config.v_hidden_act]
+
         self.dropout = nn.Dropout(0.1)
-        self.dense2 = nn.Linear(config.v_hidden_size, 1)
+        #self.dense2 = nn.Linear(config.v_hidden_size, 1)
+        self.dense2 = nn.Linear(config.v_pooler_size, 1)
 
     def forward(self, hidden_states):
         hidden_states = self.dense1(hidden_states)
@@ -852,8 +873,10 @@ class BertPreTrainingHeads(nn.Module):
             prediction_scores_v_dict = self.imagePredictions(sequence_output_v)
 
         if discriminator_only or output_discriminator_score:
-            discriminator_score_t = self.discriminator(sequence_output_t)
-            discriminator_score_v = self.discriminator(sequence_output_v)
+            #discriminator_score_t = self.discriminator(sequence_output_t)
+            #discriminator_score_v = self.discriminator(sequence_output_v)
+            discriminator_score_t = self.discriminator(pooled_output_t)
+            discriminator_score_v = self.discriminator(pooled_output_v)
             discriminator_score_t = self.sigmoid(discriminator_score_t)
             discriminator_score_v = self.sigmoid(discriminator_score_v)
 
@@ -1131,6 +1154,7 @@ class BertForVLPreTraining(BertPreTrainedModel):
         self.loss_fct = nn.CrossEntropyLoss(ignore_index=-1)
         self.loss_bce = nn.BCELoss()
         self.loss_multi_label = torch.nn.BCEWithLogitsLoss()
+
         self.visual_target_weights = config.visual_target_weights
         print("model's visual targets are ", [ix for ix, w in config.visual_target_weights.items() if w > 0])
 
@@ -1150,6 +1174,25 @@ class BertForVLPreTraining(BertPreTrainedModel):
             alphas = (num_ones / num_classes).unsqueeze(1)
         return (1 - alphas) * x + alphas / num_classes
 
+    def KLRegularizer(self, x, eps=1e-6):
+        '''
+        Searching NN in one batch to calculate KL loss
+
+        :param x: (batch, dim)
+        :return: kl loss
+        '''
+
+        x = F.normalize(x, dim=-1)
+        batch = x.size(0)
+        dim = x.size(1)
+        y = x.view(1, batch, dim) - x.view(batch, 1, dim)
+        y = torch.norm(y * y, dim=-1) + torch.eye(y.size(0), device=y.device)
+
+        nn_dists, _ = torch.min(y, dim=1)
+        kl_loss = torch.mean(-torch.log(nn_dists + eps))
+
+        return kl_loss
+
     def update_v_prototypes(self, v_prototypes):
         v_categories_to_tokens, v_attr_categories_to_tokens = v_prototypes
 
@@ -1158,13 +1201,11 @@ class BertForVLPreTraining(BertPreTrainedModel):
         for ix in self.cls.imagePredictions.decoder_dict:
             v_weight = self.cls.imagePredictions.decoder_dict[ix].weight
             v_bias = self.cls.imagePredictions.decoder_dict[ix].bias
-
-            assert v_categories_to_tokens.shape[0] == v_weight.shape[0]
-
             for i, l_tokens in enumerate(v_categories_to_tokens):
                 nonzero_ind = l_tokens[l_tokens != 0]
-                v_weight.data[i] = t_weight[nonzero_ind].sum(dim=0).data.clone() / len(nonzero_ind)
-                v_bias.data[i] = t_bias[nonzero_ind].sum(dim=0).data.clone() / len(nonzero_ind)
+                n_nonzero_ind = len(nonzero_ind)
+                v_weight.data[i] = t_weight[nonzero_ind].sum(dim=0).data.clone() / n_nonzero_ind
+                v_bias.data[i] = t_bias[nonzero_ind].sum(dim=0).data.clone() / n_nonzero_ind
 
     def tie_weights(self):
         """ Make sure we are sharing the input and output embeddings.
@@ -1207,11 +1248,13 @@ class BertForVLPreTraining(BertPreTrainedModel):
         attr_confs=None,
         image_attrs=None,
         next_sentence_label=None,
+        caption_avail=None,
         output_all_attention_masks=False,
         add_domain_confusion_loss=False,
         add_multi_label_loss_t=False,
         add_multi_label_loss_v=False,
-        confuse_discriminator_only=False
+        confuse_discriminator_only=False,
+        add_kl_entropy_reg=False
     ):
         # separately feed visual and language inputs to the same model
         # feed visual part
@@ -1241,8 +1284,8 @@ class BertForVLPreTraining(BertPreTrainedModel):
             prediction_scores_t, prediction_scores_v_dict, seq_relationship_score, pooled_output = cls_outputs
 
         discriminator_loss_t, discriminator_loss_v = 0, 0
-        device = discriminator_score_t.device
         if confuse_discriminator_only:
+            device = discriminator_score_t.device
             conf_discriminator_loss_t = self.loss_bce(discriminator_score_t,
                                                       torch.ones_like(discriminator_score_t, device=device))
             conf_discriminator_loss_v = self.loss_bce(discriminator_score_v,
@@ -1262,7 +1305,6 @@ class BertForVLPreTraining(BertPreTrainedModel):
                 img_loss += pre_vis_criterions[ix](prediction_scores_v, weight, image_label, image_cls, image_feat,
                                                    obj_labels, obj_confs, attr_labels, attr_confs)
 
-            multilabel_loss_v = None
             if add_multi_label_loss_v:
                 multi_label_target_v = torch.nn.functional.one_hot(obj_labels, num_classes=prediction_scores_global_v.size(1))
                 multi_label_target_v = torch.sum(multi_label_target_v, dim=1) > 0
@@ -1270,6 +1312,8 @@ class BertForVLPreTraining(BertPreTrainedModel):
                 multi_label_target_v = self._smooth_label(multi_label_target_v, alpha=1e-2)
                 multilabel_loss_v = self.loss_multi_label(prediction_scores_global_v, multi_label_target_v)
                 multilabel_loss_v *= self.config.multilabel_loss_v_weight
+            else:
+                multilabel_loss_v = torch.zeros(1).cuda()
 
             masked_img_loss = True if img_loss > 0 else False
             if masked_img_loss:
@@ -1277,7 +1321,6 @@ class BertForVLPreTraining(BertPreTrainedModel):
             else:
                 img_loss = torch.zeros(1).cuda()
 
-            multilabel_loss_t = None
             if add_multi_label_loss_t:
                 num_classes = prediction_scores_t.size(2)
                 multi_label_target_t = masked_lm_labels.clone()
@@ -1289,6 +1332,15 @@ class BertForVLPreTraining(BertPreTrainedModel):
                 prediction_scores_cls_token = prediction_scores_t[::, 0]
                 multilabel_loss_t = self.loss_multi_label(prediction_scores_cls_token, multi_label_target_t)
                 multilabel_loss_t *= self.config.multilabel_loss_t_weight
+            else:
+                multilabel_loss_t = torch.zeros(1).cuda()
+
+            if add_kl_entropy_reg:
+                kl_entropy_t = self.KLRegularizer(pooled_output_t)
+                kl_entropy_v = self.KLRegularizer(pooled_output_v)
+            else:
+                kl_entropy_t = torch.zeros(1).cuda()
+                kl_entropy_v = torch.zeros(1).cuda()
 
             if masked_lm_labels is not None:
                 masked_lm_loss = self.loss_fct(
@@ -1304,6 +1356,9 @@ class BertForVLPreTraining(BertPreTrainedModel):
                     neg = torch.mean(seq_relationship_score * next_sentence_label)
                     next_sentence_loss = pos - neg
                 else:
+                    next_sentence_neg_entries = torch.where(next_sentence_label == 0)[0]
+                    next_sentence_label[torch.where(caption_avail == 0)[0]] = -1
+                    next_sentence_label[next_sentence_neg_entries] = 0  # keep the entries which are zero
                     next_sentence_loss = self.loss_fct(
                         seq_relationship_score.view(-1, 2),
                         next_sentence_label.view(-1)
@@ -1312,15 +1367,19 @@ class BertForVLPreTraining(BertPreTrainedModel):
                 next_sentence_loss = torch.zeros(1).cuda()
 
             if add_domain_confusion_loss:
+                device = discriminator_score_t.device
                 # targets --> text: 0, vision: 1
                 discriminator_loss_t = self.loss_bce(discriminator_score_t,
                                                      torch.zeros_like(discriminator_score_t, device=device))
                 discriminator_loss_v = self.loss_bce(discriminator_score_v,
                                                      torch.ones_like(discriminator_score_v, device=device))
+            else:
+                discriminator_loss_t = torch.zeros(1).cuda()
+                discriminator_loss_v = torch.zeros(1).cuda()
 
         if masked_img_loss or masked_lm_loss or next_sentence_loss:
             return masked_lm_loss, img_loss, next_sentence_loss, discriminator_loss_t, discriminator_loss_v, \
-                   multilabel_loss_t, multilabel_loss_v
+                   multilabel_loss_t, multilabel_loss_v, kl_entropy_t, kl_entropy_v
         else:
             return prediction_scores_t, prediction_scores_v_dict, seq_relationship_score, all_attention_mask, pooled_output
 
@@ -1358,11 +1417,19 @@ class BertForVLTasks(BertPreTrainedModel):
                     )
                 else:
                     task2clf[task_id] = nn.Linear(config.v_hidden_size, 1)
+            elif task_type == "VL-cos-logit":
+                task2clf[task_id] = None
             else:
                 raise ValueError("Undefined task type: %s" % task_type)
 
         self.clfs_dict = nn.ModuleDict(task2clf)
 
+        self.norm_before_fusion = None
+        if hasattr(config, "norm_before_fusion"):
+            self.norm_before_fusion = config.norm_before_fusion
+        self.cos_scaling_factor = 1.
+        if hasattr(config, "cos_scaling_factor"):
+            self.cos_scaling_factor = config.cos_scaling_factor
         self.fusion_method = config.fusion_method
         self.apply(self.init_weights)
 
@@ -1415,8 +1482,11 @@ class BertForVLTasks(BertPreTrainedModel):
             output_all_attention_masks=output_all_attention_masks,
         )'''
 
-        linguisic_prediction, vision_prediction = None, None
+        if self.norm_before_fusion == "l2":
+            pooled_output_t = F.normalize(pooled_output_t, p=2, dim=-1)
+            pooled_output_v = F.normalize(pooled_output_v, p=2, dim=-1)
 
+        linguisic_prediction, vision_prediction = None, None
         if self.fusion_method == "sum":
             pooled_output = self.dropout(pooled_output_t + pooled_output_v)
         elif self.fusion_method == "mul":
@@ -1425,6 +1495,8 @@ class BertForVLTasks(BertPreTrainedModel):
             pooled_output = self.dropout(pooled_output_t)
         elif self.fusion_method == "vl-bert_vqa":
             pooled_output = self.dropout(pooled_output_t)
+        elif self.fusion_method == "dot":
+            pooled_output = self.cos_scaling_factor * torch.sum(pooled_output_t * pooled_output_v, dim=-1)
         elif self.fusion_method == "none":
             pooled_output = None
         else:
@@ -1436,6 +1508,8 @@ class BertForVLTasks(BertPreTrainedModel):
         elif self.task_cfg[task_id]["type"] == "VL-binary-classifier":
             # NLVR
             vil_prediction = self.clfs_dict[task_id](pooled_output.view(-1, pooled_output.size(1) * 2))
+        elif self.task_cfg[task_id]["type"] == "VL-cos-logit":
+            vil_prediction = pooled_output
         else:
             vil_prediction = self.clfs_dict[task_id](pooled_output)
 

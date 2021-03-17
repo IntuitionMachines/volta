@@ -94,6 +94,17 @@ def xent_1600(prediction_scores_v, weight, label, image_cls, image_feat, obj_lab
         return 0
 
 
+def xent_1600_nomask(prediction_scores_v, weight, label, image_cls, image_feat, obj_labels, obj_confs, attr_labels, attr_confs):
+    if (weight > 0) and (obj_labels is not None) and (obj_confs is not None):
+        # hard object labels
+        image_target, mask_conf = obj_labels, obj_confs
+        loss = nn.CrossEntropyLoss(reduction='none')(prediction_scores_v.reshape(-1, 1600), image_target.view(-1,))
+        loss = loss * mask_conf.view(-1)
+        return weight * torch.mean(loss)
+    else:
+        return 0
+
+
 def xent_400(prediction_scores_v, weight, label, image_cls, image_feat, obj_labels, obj_confs, attr_labels, attr_confs):
     if (weight > 0) and (attr_labels is not None) and (attr_confs is not None):
         # hard attribute labels
@@ -133,7 +144,8 @@ pre_vis_targets = {
     "3": 1600,
     "4": 400,
     "5": 2048,
-    "6": 1601
+    "6": 1601,
+    "7": 1600,
 }
 
 pre_vis_criterions = {
@@ -144,4 +156,5 @@ pre_vis_criterions = {
     "4": xent_400,
     "5": huber_2048,
     "6": xent_1601,
+    "7": xent_1600_nomask,
 }

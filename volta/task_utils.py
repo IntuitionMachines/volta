@@ -88,8 +88,11 @@ def ForwardModelsVal(config, task_cfg, device, task_id, batch, model, criterion)
         segment_ids = segment_ids.repeat(1, 2)
         segment_ids = segment_ids.view(batch_size * 2, int(segment_ids.size(1) / 2))
 
-    vil_prediction, vision_prediction, linguisic_prediction, _ = model(question, features, spatials, task_id,
-                                                                       segment_ids, input_mask, image_mask)
+    vil_prediction, vision_prediction, linguisic_prediction, _, kl_entropy_t, kl_entropy_v = model(question, features,
+                                                                                                   spatials, task_id,
+                                                                                                   segment_ids,
+                                                                                                   input_mask,
+                                                                                                   image_mask)
 
     if task_cfg[task_id]["type"] == "VL-classifier":
         loss = criterion(vil_prediction, target)
@@ -101,11 +104,19 @@ def ForwardModelsVal(config, task_cfg, device, task_id, batch, model, criterion)
         loss = loss.mean() * target.size(1)
         batch_score = compute_score_with_logits(vil_prediction, target).sum()
 
-    elif task_cfg[task_id]["type"] == "VL-logit":
+    elif task_cfg[task_id]["type"] == "VL-logit" or task_cfg[task_id]["type"] == "VL-cos-logit":
         vil_logit = vil_prediction.view(batch_size, num_options)
         loss = criterion(vil_logit, target)
         _, preds = torch.max(vil_logit, 1)
         batch_score = (preds == target).sum()
+
+    elif task_cfg[task_id]["type"] == "VL-cos":
+        vil_cos = vil_prediction.view(batch_size, num_options)
+        pos = (1 - vil_cos[:, 0])
+        neg = (vil_cos[:, 1::] - task_cfg[task_id]['margin'])
+        neg = torch.clamp(neg, min=0).sum(-1)
+        loss = (pos + neg).mean()
+        batch_score = vil_cos[:, 0].sum()
 
     elif task_cfg[task_id]["type"] == "V-logit":
         loss = criterion(vil_prediction, target)
@@ -137,7 +148,7 @@ def ForwardModelsVal(config, task_cfg, device, task_id, batch, model, criterion)
     return float(loss), float(batch_score), batch_size
 
 
-def ForwardModelsTrain(config, task_cfg, device, task_id, batch, model, criterion):
+def ForwardModelsTrain(config, task_cfg, device, task_id, batch, model, criterion, add_kl_entropy_reg=False):
     batch = tuple(t.cuda(device=device, non_blocking=True) for t in batch)
 
     if task_cfg[task_id]["type"] == "V-logit-mc":
@@ -231,8 +242,9 @@ def ForwardModelsTrain(config, task_cfg, device, task_id, batch, model, criterio
         segment_ids = segment_ids.repeat(1, 2)
         segment_ids = segment_ids.view(batch_size * 2, int(segment_ids.size(1) / 2))
 
-    vil_prediction, vision_prediction, linguisic_prediction, _ = model(question, features, spatials, task_id,
-                                                                       segment_ids, input_mask, image_mask)
+    vil_prediction, vision_prediction, linguisic_prediction, _, kl_entropy_t, kl_entropy_v = \
+        model(question, features, spatials, task_id, segment_ids, input_mask, image_mask,
+              add_kl_entropy_reg=add_kl_entropy_reg)
 
     # for different task, we use different output to calculate the loss.
     if task_cfg[task_id]["type"] == "VL-classifier":
@@ -245,11 +257,19 @@ def ForwardModelsTrain(config, task_cfg, device, task_id, batch, model, criterio
         loss = loss.mean() * target.size(1)
         batch_score = compute_score_with_logits(vil_prediction, target).sum() / float(batch_size)
 
-    elif task_cfg[task_id]["type"] == "VL-logit":
+    elif task_cfg[task_id]["type"] == "VL-logit" or task_cfg[task_id]["type"] == "VL-cos-logit":
         vil_logit = vil_prediction.view(batch_size, num_options)
         loss = criterion(vil_logit, target)
         _, preds = torch.max(vil_logit, 1)
         batch_score = (preds == target).sum() / float(batch_size)
+
+    elif task_cfg[task_id]["type"] == "VL-cos":
+        vil_cos = vil_prediction.view(batch_size, num_options)
+        pos = (1 - vil_cos[:, 0])
+        neg = (vil_cos[:, 1::] - task_cfg[task_id]['margin'])
+        neg = torch.clamp(neg, min=0).sum(-1)
+        loss = (pos + neg).mean()
+        batch_score = vil_cos[:, 0].sum()
 
     elif task_cfg[task_id]["type"] == "V-logit":
         loss = criterion(vil_prediction, target)
@@ -278,7 +298,7 @@ def ForwardModelsTrain(config, task_cfg, device, task_id, batch, model, criterio
         loss = loss.mean()
         batch_score = compute_score_with_logits(vil_prediction, target).sum() / float(batch_size)
 
-    return loss, batch_score
+    return loss, kl_entropy_t, kl_entropy_v, batch_score
 
 
 def LoadLoss(task_cfg, task_id):
@@ -305,8 +325,10 @@ def LoadDataset(args, config, task_cfg, task_id, split="trainval"):
     batch_size = task_cfg[task]["batch_size"] // args.grad_acc_steps
     num_workers = args.num_workers
     if args.local_rank != -1:
-        batch_size = int(batch_size / dist.get_world_size())
-        num_workers = int(num_workers / dist.get_world_size())
+        num_replicas = dist.get_world_size()
+        batch_size = int(batch_size / num_replicas)
+        num_workers = int(num_workers / num_replicas)
+        args.seed = args.seed + args.local_rank
 
     logger.info("Loading %s Dataset with batch size %d" % (task_name, batch_size))
     dset_train, dset_train, task2num_iters = None, None, {}

@@ -84,6 +84,11 @@ def parse_args():
     parser.add_argument("--warmup_steps", default=None, type=float,
                         help="Number of training steps to perform linear learning rate warmup for. "
                              "It overwrites --warmup_proportion.")
+    # Objectives
+    parser.add_argument("--add_kl_entropy_reg", default=False, action="store_true")
+    parser.add_argument("--kl_w", type=float, default=1.0,
+                        help="kl_entropy_reg weight")
+
     # Seed
     parser.add_argument("--seed", type=int, default=0,
                         help="random seed for initialization")
@@ -113,16 +118,18 @@ def parse_args():
 
 def main():
     args = parse_args()
-
     # Devices
     if args.local_rank == -1:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         n_gpu = torch.cuda.device_count()
     else:
-        torch.cuda.set_device(args.local_rank)
-        device = torch.device("cuda", args.local_rank)
+        local_rank = int(os.environ['LOCAL_RANK'])
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
         n_gpu = 1
         torch.distributed.init_process_group(backend="nccl")
+        args.local_rank = local_rank
+
     default_gpu = False
     if dist.is_available() and args.local_rank != -1:
         rank = dist.get_rank()
@@ -130,7 +137,8 @@ def main():
             default_gpu = True
     else:
         default_gpu = True
-    logger.info(f"device: {device} n_gpu: {n_gpu}, distributed training: {bool(args.local_rank != -1)}")
+    logger.info(f"device: {device} n_gpu: {n_gpu}, distributed training: {bool(args.local_rank != -1)}, "
+                f"local_rank: {args.local_rank}")
 
     # Load config
     config = BertConfig.from_json_file(args.config_file)
@@ -163,19 +171,21 @@ def main():
             print("\n", file=f)
             print(config, file=f)
 
+    # Dataset
+    batch_size, task2num_iters, dset_train, dset_val, dl_train, dl_val = LoadDataset(args, config, task_cfg, args.task)
+
     # Seed
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # Dataset
-    batch_size, task2num_iters, dset_train, dset_val, dl_train, dl_val = LoadDataset(args, config, task_cfg, args.task)
-
     # Logging
     logdir = os.path.join(args.logdir, timestamp)
-    tb_logger = tbLogger(logdir, save_path, [task_name], [task], task2num_iters, args.grad_acc_steps)
-    if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
+    tb_logger = None
+    if default_gpu:
+        tb_logger = tbLogger(logdir, save_path, [task_name], [task], task2num_iters, args.grad_acc_steps)
+        if not os.path.exists(args.output_dir):
+            os.makedirs(args.output_dir)
 
     # Model
     if config.image_embeddings == 'mix_uniter':
@@ -264,6 +274,13 @@ def main():
     # Save starting model
     save(save_path, logger, -1, model, optimizer, scheduler, global_step, tb_logger, default_gpu)
 
+    # Pre-eval
+    score = evaluate(config, dl_val, task_cfg, device, task, model, criterion, start_epoch, default_gpu, tb_logger)
+    if score > max_score:
+        max_score = score
+        save(save_path, logger, start_epoch, model, optimizer, scheduler,
+             global_step, tb_logger, default_gpu, max_score)
+
     # Print summary
     if default_gpu:
         summary_parameters(model, logger)
@@ -278,8 +295,13 @@ def main():
         len_dl_train = len(dl_train)
         for step, batch in tqdm(enumerate(dl_train)):
             iter_id = start_iter_id + step + (epoch_id * len_dl_train)
+            loss, kl_entropy_t, kl_entropy_v, score = ForwardModelsTrain(config, task_cfg, device, task, batch, model,
+                                                                         criterion, add_kl_entropy_reg=args.add_kl_entropy_reg)
+            #if n_gpu > 1:
+            kl_entropy_t = kl_entropy_t.mean()
+            kl_entropy_v = kl_entropy_v.mean()
 
-            loss, score = ForwardModelsTrain(config, task_cfg, device, task, batch, model, criterion)
+            loss += args.kl_w * (kl_entropy_t + kl_entropy_v)
             if args.grad_acc_steps > 1:
                 loss = loss / args.grad_acc_steps
             loss.backward()
@@ -298,7 +320,7 @@ def main():
 
                 if default_gpu:
                     plotline = step % (20 * args.grad_acc_steps) == 0
-                    tb_logger.step_train(epoch_id, iter_id, loss, score,
+                    tb_logger.step_train(epoch_id, iter_id, loss, kl_entropy_t, kl_entropy_v, score,
                                          optimizer.param_groups[0]["lr"], task, "train", plotline=plotline)
 
             if (step % (100 * args.grad_acc_steps) == 0) and step != 0 and default_gpu:
@@ -312,18 +334,21 @@ def main():
 
         save(save_path, logger, epoch_id, model, optimizer, scheduler, global_step, tb_logger, default_gpu, max_score)
 
-    tb_logger.txt_close()
+    if default_gpu:
+        tb_logger.txt_close()
 
 
 def evaluate(config, dataloader_val, task_cfg, device, task_id, model, criterion, epoch_id, default_gpu, tb_logger):
     model.eval()
     for i, batch in enumerate(dataloader_val):
         loss, score, batch_size = ForwardModelsVal(config, task_cfg, device, task_id, batch, model, criterion)
-        tb_logger.step_val(epoch_id, loss, score, task_id, batch_size, "val")
         if default_gpu:
+            tb_logger.step_val(epoch_id, loss, score, task_id, batch_size, "val")
             sys.stdout.write("%d/%d\r" % (i, len(dataloader_val)))
             sys.stdout.flush()
-    score = tb_logger.showLossVal(task_id)
+
+    if default_gpu:
+        score = tb_logger.showLossVal(task_id)
     model.train()
     return score
 

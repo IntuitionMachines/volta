@@ -21,6 +21,8 @@
   "visual_target_weights": {"3": 1.0},
   "multilabel_loss_v_weight": 1.0,
   "multilabel_loss_t_weight": 10.0,
+  "kl_entropy_weight": 0.1,
+  "adversarial_weight": 0.5,
   "v_hidden_size": 768,
   "v_initializer_range": 0.02,
   "v_pooler_size": 1024,

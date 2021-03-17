@@ -597,13 +597,22 @@ class BertTextPooler(nn.Module):
     def __init__(self, config):
         super(BertTextPooler, self).__init__()
         self.dense = nn.Linear(config.hidden_size, config.pooler_size)
-        self.activation = nn.ReLU()
+        if config.pooler_act == 'relu':
+            self.activation = nn.ReLU()
+        elif config.pooler_act == 'gelu':
+            self.activation = GeLU()
+        elif config.pooler_act == 'none':
+            self.activation = None
+        else:
+            raise NotImplementedError
 
     def forward(self, hidden_states):
         # We "pool" the model by simply taking the hidden state corresponding to the first token.
         first_token_tensor = hidden_states[:, 0]
         pooled_output = self.dense(first_token_tensor)
-        pooled_output = self.activation(pooled_output)
+
+        if self.activation:
+            pooled_output = self.activation(pooled_output)
         return pooled_output
 
 
@@ -611,7 +620,14 @@ class VLBertTextPooler(nn.Module):
     def __init__(self, config):
         super(VLBertTextPooler, self).__init__()
         self.dense = nn.Linear(config.hidden_size, config.pooler_size)
-        self.activation = nn.ReLU()
+        if config.pooler_act == 'relu':
+            self.activation = nn.ReLU()
+        elif config.pooler_act == 'gelu':
+            self.activation = GeLU()
+        elif config.pooler_act == 'none':
+            self.activation = None
+        else:
+            raise NotImplementedError
 
     def forward(self, hidden_states, text_end):
         # We "pool" the model by simply taking the hidden state corresponding to the first token.
@@ -619,7 +635,8 @@ class VLBertTextPooler(nn.Module):
                                      torch.arange(hidden_states.size(1), dtype=torch.long, device=hidden_states.device))
         mask_token_tensor = hidden_states[(grid_pos == text_end - 2)]
         pooled_output = self.dense(mask_token_tensor)
-        pooled_output = self.activation(pooled_output)
+        if self.activation:
+            pooled_output = self.activation(pooled_output)
         return pooled_output
 
 
@@ -627,13 +644,19 @@ class BertImagePooler(nn.Module):
     def __init__(self, config):
         super(BertImagePooler, self).__init__()
         self.dense = nn.Linear(config.v_hidden_size, config.v_pooler_size)
-        self.activation = nn.ReLU()
+        if config.pooler_act == 'relu':
+            self.activation = nn.ReLU()
+        elif config.pooler_act == 'gelu':
+            self.activation = GeLU()
+        elif config.pooler_act == 'none':
+            self.activation = None
 
     def forward(self, hidden_states):
         # We "pool" the model by simply taking the hidden state corresponding to the first token.
         first_token_tensor = hidden_states[:, 0]
         pooled_output = self.dense(first_token_tensor)
-        pooled_output = self.activation(pooled_output)
+        if self.activation:
+            pooled_output = self.activation(pooled_output)
         return pooled_output
 
 
@@ -1137,6 +1160,8 @@ class BertForVLTasks(BertPreTrainedModel):
                 task2clf[task_id] = nn.Linear(config.pooler_size, 3)  # for Visual Entailiment tasks
             elif task_type == "VL-logit":
                 task2clf[task_id] = nn.Linear(config.pooler_size, 1)
+            elif task_type == "VL-cos":
+                task2clf[task_id] = None
             elif task_type.startswith("V-logit"):
                 if task_cfg[task_id].get("num_clf_layers", 1) == 2:
                     task2clf[task_id] = torch.nn.Sequential(
@@ -1155,6 +1180,26 @@ class BertForVLTasks(BertPreTrainedModel):
         self.fusion_method = config.fusion_method
         self.apply(self.init_weights)
 
+    def KLRegularizer(self, x, eps=1e-6, pre_norm=False):
+        '''
+        Searching NN in one batch to calculate KL loss
+
+        :param x: (batch, dim)
+        :return: kl loss
+        '''
+
+        if not pre_norm:
+            x = F.normalize(x, dim=-1)
+        batch = x.size(0)
+        dim = x.size(1)
+        y = x.view(1, batch, dim) - x.view(batch, 1, dim)
+        y = torch.norm(y * y, dim=-1) + torch.eye(y.size(0), device=y.device)
+
+        nn_dists, _ = torch.min(y, dim=1)
+        kl_loss = torch.mean(-torch.log(nn_dists + eps))
+
+        return kl_loss
+
     def forward(
         self,
         input_txt,
@@ -1166,6 +1211,7 @@ class BertForVLTasks(BertPreTrainedModel):
         image_attention_mask=None,
         output_all_encoded_layers=False,
         output_all_attention_masks=False,
+        add_kl_entropy_reg=False
     ):
 
         sequence_output_t, sequence_output_v, pooled_output_t, pooled_output_v, all_attention_mask = self.bert(
@@ -1180,19 +1226,38 @@ class BertForVLTasks(BertPreTrainedModel):
         )
 
         linguisic_prediction, vision_prediction = None, None
+        pre_norm = False
+        if self.task_cfg[task_id]["type"] == "VL-cos":
+            pooled_output_t = F.normalize(pooled_output_t, dim=-1)
+            pooled_output_v = F.normalize(pooled_output_v, dim=-1)
+            pre_norm = True
 
-        if self.fusion_method == "sum":
-            pooled_output = self.dropout(pooled_output_t + pooled_output_v)
-        elif self.fusion_method == "mul":
-            pooled_output = self.dropout(pooled_output_t * pooled_output_v)
-        elif self.fusion_method == "text":
-            pooled_output = self.dropout(pooled_output_t)
-        elif self.fusion_method == "vl-bert_vqa":
-            pooled_output = self.dropout(pooled_output_t)
-        elif self.fusion_method == "none":
-            pooled_output = None
+        if add_kl_entropy_reg:
+            kl_entropy_t = self.KLRegularizer(pooled_output_t, pre_norm)
+            kl_entropy_v = self.KLRegularizer(pooled_output_v, pre_norm)
         else:
-            raise ValueError("Invalid fusion method: %s" % self.fusion_method)
+            kl_entropy_t = torch.zeros(1).cuda()
+            kl_entropy_v = torch.zeros(1).cuda()
+
+        if self.task_cfg[task_id]["type"] == "VL-cos":
+            pooled_output = (pooled_output_t * pooled_output_v).sum(-1)
+        else:
+            if self.fusion_method == "sum":
+                pooled_output = self.dropout(pooled_output_t + pooled_output_v)
+            elif self.fusion_method == "mul":
+                pooled_output = self.dropout(pooled_output_t * pooled_output_v)
+            elif self.fusion_method == "norm_mul":
+                pooled_output_t = F.normalize(self.dropout(pooled_output_t), dim=-1)
+                pooled_output_v = F.normalize(self.dropout(pooled_output_v), dim=-1)
+                pooled_output = F.normalize(pooled_output_t * pooled_output_v, dim=-1)
+            elif self.fusion_method == "text":
+                pooled_output = self.dropout(pooled_output_t)
+            elif self.fusion_method == "vl-bert_vqa":
+                pooled_output = self.dropout(pooled_output_t)
+            elif self.fusion_method == "none":
+                pooled_output = None
+            else:
+                raise ValueError("Invalid fusion method: %s" % self.fusion_method)
 
         if self.task_cfg[task_id]["type"].startswith("V-logit"):
             vil_prediction = self.clfs_dict[task_id](self.dropout(sequence_output_v)) + (
@@ -1200,7 +1265,9 @@ class BertForVLTasks(BertPreTrainedModel):
         elif self.task_cfg[task_id]["type"] == "VL-binary-classifier":
             # NLVR
             vil_prediction = self.clfs_dict[task_id](pooled_output.view(-1, pooled_output.size(1) * 2))
+        elif self.task_cfg[task_id]["type"] == "VL-cos":
+            vil_prediction = pooled_output
         else:
             vil_prediction = self.clfs_dict[task_id](pooled_output)
 
-        return vil_prediction, vision_prediction, linguisic_prediction, all_attention_mask
+        return vil_prediction, vision_prediction, linguisic_prediction, all_attention_mask, kl_entropy_t, kl_entropy_v

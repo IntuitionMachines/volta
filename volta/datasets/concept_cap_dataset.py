@@ -87,7 +87,8 @@ class InputExample(object):
         num_boxes=None,
         overlaps=None,
         obj_tokens=None,
-        attr_tokens=None
+        attr_tokens=None,
+        caption_avail_label=None
     ):
         """Constructs a InputExample.
         Args:
@@ -114,6 +115,7 @@ class InputExample(object):
         self.overlaps = overlaps
         self.obj_tokens = obj_tokens
         self.attr_tokens = attr_tokens
+        self.caption_avail_label = caption_avail_label
 
 
 class InputFeatures(object):
@@ -139,6 +141,7 @@ class InputFeatures(object):
         obj_tokens=None,
         attr_tokens=None,
         masked_label=None,
+        caption_avail_label=None
     ):
         self.input_ids = input_ids
         self.input_mask = input_mask
@@ -158,6 +161,7 @@ class InputFeatures(object):
         self.obj_tokens = obj_tokens
         self.attr_tokens = attr_tokens
         self.masked_label = masked_label
+        self.caption_avail_label = caption_avail_label
 
 
 class ConceptCapLoaderTrain(object):
@@ -197,11 +201,13 @@ class ConceptCapLoaderTrain(object):
         objective=0,
         num_locs=5,
         add_global_imgfeat=None,
-        visual_target_categories_file=None
+        visual_target_categories_file=None,
+        caption_availability=1.,
     ):
         if dist.is_available() and local_rank != -1:
             rank = dist.get_rank()
-            lmdb_file = os.path.join(features_path, "training_feat_part_" + str(rank) + ".lmdb")
+            #lmdb_file = os.path.join(features_path, "training_feat_part_" + str(rank) + ".lmdb")
+            lmdb_file = os.path.join(features_path, "training_feat_all.lmdb")
         else:
             lmdb_file = os.path.join(features_path, "training_feat_all.lmdb")
 
@@ -212,6 +218,7 @@ class ConceptCapLoaderTrain(object):
         ds = td.LocallyShuffleData(ds, cache)
         caption_path = os.path.join(annotations_path, "caption_train.json")
 
+        self.caption_availability_dict = self._label_caption_availability(caption_path, caption_availability)
         preprocess_function = BertPreprocessBatch(
             caption_path,
             tokenizer,
@@ -221,7 +228,8 @@ class ConceptCapLoaderTrain(object):
             self.num_dataset,
             objective=objective,
             num_locs=num_locs,
-            visual_target_categories_file=visual_target_categories_file
+            visual_target_categories_file=visual_target_categories_file,
+            caption_availability=self.caption_availability_dict
         )
 
         ds = td.PrefetchData(ds, 10000, 1)
@@ -240,16 +248,15 @@ class ConceptCapLoaderTrain(object):
 
     def __iter__(self):
         for batch in self.ds.get_data():
-
             # obj_labels \in [0, 1599], "background" class not included
             if self.tokenize_visual_categories:
                 input_ids, input_mask, segment_ids, lm_label_ids, is_next, image_feat, image_loc, \
                     image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs, image_label, \
-                image_mask, masked_label, obj_tokens, attr_tokens, image_id = batch
+                image_mask, masked_label, obj_tokens, attr_tokens, caption_avail, image_id = batch
             else:
                 input_ids, input_mask, segment_ids, lm_label_ids, is_next, image_feat, image_loc, \
                 image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs, image_label, \
-                image_mask, masked_label, image_id = batch
+                image_mask, masked_label, caption_avail, image_id = batch
 
             batch_size = input_ids.shape[0]
 
@@ -302,6 +309,7 @@ class ConceptCapLoaderTrain(object):
                     image_mask,
                     obj_tokens,
                     attr_tokens,
+                    caption_avail,
                     image_id
                 )
             else:
@@ -321,6 +329,7 @@ class ConceptCapLoaderTrain(object):
                     image_attrs,
                     image_label,
                     image_mask,
+                    caption_avail,
                     image_id
                 )
 
@@ -329,6 +338,12 @@ class ConceptCapLoaderTrain(object):
 
     def __len__(self):
         return self.ds.size()
+
+    def _label_caption_availability(self, caption_path, caption_availability):
+        image_ids = list(json.load(open(caption_path, "r")).keys())
+        num_captions = len(image_ids)
+        availability = (np.random.rand(num_captions) < caption_availability).astype(np.int)
+        return {id: avail for id, avail in zip(image_ids, availability)}
 
 
 class ConceptCapLoaderVal(object):
@@ -368,7 +383,8 @@ class ConceptCapLoaderVal(object):
             num_locs=5,
             add_global_imgfeat=True,
             visualization=False,
-            visual_target_categories_file=None
+            visual_target_categories_file=None,
+            caption_availability=1.
     ):
         lmdb_file = os.path.join(features_path, "validation_feat_all.lmdb")
         caption_path = os.path.join(annotations_path, "caption_valid.json")
@@ -376,6 +392,7 @@ class ConceptCapLoaderVal(object):
 
         ds = td.LMDBSerializer.load(lmdb_file, shuffle=False)
         self.num_dataset = len(ds)
+        self.caption_availability_dict = self._label_caption_availability(caption_path, caption_availability)
         preprocess_function = BertPreprocessBatch(
             caption_path,
             tokenizer,
@@ -386,7 +403,8 @@ class ConceptCapLoaderVal(object):
             visualization=visualization,
             objective=objective,
             num_locs=num_locs,
-            visual_target_categories_file=visual_target_categories_file
+            visual_target_categories_file=visual_target_categories_file,
+            caption_availability=self.caption_availability_dict
         )
 
         ds = td.MapData(ds, preprocess_function)
@@ -404,11 +422,11 @@ class ConceptCapLoaderVal(object):
             if self.tokenize_visual_categories:
                 input_ids, input_mask, segment_ids, lm_label_ids, is_next, image_feat, image_loc, \
                     image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs, image_label, \
-                image_mask, masked_label, obj_tokens, attr_tokens, image_id = batch
+                image_mask, masked_label, obj_tokens, attr_tokens, caption_avail, image_id = batch
             else:
                 input_ids, input_mask, segment_ids, lm_label_ids, is_next, image_feat, image_loc, \
                 image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs, image_label, \
-                image_mask, masked_label, image_id = batch
+                image_mask, masked_label, caption_avail, image_id = batch
 
             batch_size = input_ids.shape[0]
 
@@ -445,7 +463,8 @@ class ConceptCapLoaderVal(object):
                     image_label,
                     image_mask,
                     obj_tokens,
-                    attr_tokens
+                    attr_tokens,
+                    caption_avail
                 )
             else:
                 batch = (
@@ -463,12 +482,19 @@ class ConceptCapLoaderVal(object):
                     attr_confs,
                     image_attrs,
                     image_label,
-                    image_mask
+                    image_mask,
+                    caption_avail
                 )
             yield tuple([torch.tensor(data) for data in batch] + [image_id])
 
     def __len__(self):
         return self.ds.size()
+
+    def _label_caption_availability(self, caption_path, caption_availability):
+        image_ids = list(json.load(open(caption_path, "r")).keys())
+        num_captions = len(image_ids)
+        availability = (np.random.rand(num_captions) < caption_availability).astype(np.int)
+        return {id: avail for id, avail in zip(image_ids, availability)}
 
 
 class BertPreprocessBatch(object):
@@ -484,7 +510,8 @@ class BertPreprocessBatch(object):
             visualization=False,
             objective=0,
             num_locs=5,
-            visual_target_categories_file=None
+            visual_target_categories_file=None,
+            caption_availability={}
     ):
 
         self.split = split
@@ -503,6 +530,7 @@ class BertPreprocessBatch(object):
         self.get_visual_categories(visual_target_categories_file)
         self.tokenize_visual_categories = True if (self.vis_categories is not None and
                                                    self.vis_att_categories is not None) else False
+        self.caption_availability = caption_availability
 
     def _img_token_to_name(self, obj_labels, attr_labels):
         obj_tokens = [self.vis_category_to_tokenIds[i] for i in obj_labels]
@@ -513,6 +541,8 @@ class BertPreprocessBatch(object):
     def __call__(self, data):
         image_feature_wp, image_cls_wp, obj_labels, obj_confs, attr_labels, attr_confs, attr_scores, \
             image_location_wp, num_boxes, image_h, image_w, image_id, caption = data
+
+        caption_avail_label = self.caption_availability[image_id]
 
         image_feature = np.zeros((self.region_len, 2048), dtype=np.float32)
         image_cls = np.zeros((self.region_len, 1601), dtype=np.float32)
@@ -562,7 +592,9 @@ class BertPreprocessBatch(object):
                        is_next=label,
                        image_loc=image_location,
                        num_boxes=num_boxes,
-                       overlaps=overlaps)
+                       overlaps=overlaps,
+                       caption_avail_label=caption_avail_label)
+
         if self.tokenize_visual_categories:
             example.update(dict(obj_tokens=obj_tokens, attr_tokens=attr_tokens))
 
@@ -590,6 +622,7 @@ class BertPreprocessBatch(object):
                 cur_features.masked_label,
                 cur_features.obj_tokens,
                 cur_features.attr_tokens,
+                cur_features.caption_avail_label,
                 image_id,
             )
         else:
@@ -610,8 +643,10 @@ class BertPreprocessBatch(object):
                 cur_features.image_label,
                 cur_features.image_mask,
                 cur_features.masked_label,
+                cur_features.caption_avail_label,
                 image_id,
             )
+
         return cur_tensors
 
     def get_visual_categories(self, path, max_length=5):
@@ -750,7 +785,8 @@ class BertPreprocessBatch(object):
                       image_loc=image_loc,
                       image_label=np.array(image_label),
                       image_mask=np.array(image_mask),
-                      masked_label=masked_label)
+                      masked_label=masked_label,
+                      caption_avail_label=example.caption_avail_label)
 
         if self.tokenize_visual_categories:
             assert len(example.obj_tokens) == max_region_length

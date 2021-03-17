@@ -101,9 +101,15 @@ def parse_args():
                              "4: without ITM loss, ALWAYS sample negative pairs, domain confusion")
     parser.add_argument("--add_multi_label_loss_t", action="store_true")
     parser.add_argument("--add_multi_label_loss_v", action="store_true")
+    parser.add_argument("--add_kl_entropy_reg", action="store_true")
+    parser.add_argument("--aligned_pairs_proportion", default=1.0, type=float,
+                        help="how much proportion of aligned data will be used in training")
+
     # UDA Training Specifics
     parser.add_argument("--freeze_bert", action="store_true",
                         help="whether freeze bert when training generator")
+    parser.add_argument("--caption_availability", default=1., type=float,
+                        help="to use how many portion of image-text pairs")
 
     # Optimizer
     parser.add_argument("--adam_epsilon", default=1e-8, type=float,
@@ -120,16 +126,18 @@ def parse_args():
 
 def main():
     args = parse_args()
-
     # Devices
     if args.local_rank == -1:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         n_gpu = torch.cuda.device_count()
     else:
-        torch.cuda.set_device(args.local_rank)
-        device = torch.device("cuda", args.local_rank)
+        local_rank = int(os.environ['LOCAL_RANK'])
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
         n_gpu = 1
         torch.distributed.init_process_group(backend="nccl")  # Init distributed backend for sychronizing nodes/GPUs
+        args.local_rank = local_rank
+
     default_gpu = False
     if dist.is_available() and args.local_rank != -1:
         rank = dist.get_rank()
@@ -137,7 +145,8 @@ def main():
             default_gpu = True
     else:
         default_gpu = True
-    logger.info(f"device: {device} n_gpu: {n_gpu}, distributed training: {bool(args.local_rank != -1)}")
+    logger.info(f"device: {device} n_gpu: {n_gpu}, distributed training: {bool(args.local_rank != -1)}, "
+                f"local_rank: {args.local_rank}")
 
     # Load config
     config = BertConfig.from_json_file(args.config_file)
@@ -165,6 +174,8 @@ def main():
         args.train_batch_size = args.train_batch_size // num_replicas
         args.num_workers = args.num_workers // num_replicas
         cache = cache // num_replicas
+        args.num_train_epochs = args.num_train_epochs // num_replicas
+        args.seed = args.seed + args.local_rank
 
     # Seed
     random.seed(args.seed)
@@ -180,12 +191,14 @@ def main():
                                           num_workers=args.num_workers, local_rank=args.local_rank,
                                           objective=args.objective, cache=cache,
                                           add_global_imgfeat=config.add_global_imgfeat, num_locs=config.num_locs,
-                                          visual_target_categories_file=config.visual_target_categories_file)
+                                          visual_target_categories_file=config.visual_target_categories_file,
+                                          caption_availability=args.caption_availability)
     valid_dataset = ConceptCapLoaderVal(args.annotations_path, args.features_path, tokenizer, args.bert_model,
                                         seq_len=args.max_seq_length, batch_size=args.train_batch_size, num_workers=2,
                                         objective=args.objective, add_global_imgfeat=config.add_global_imgfeat,
                                         num_locs=config.num_locs,
-                                        visual_target_categories_file=config.visual_target_categories_file)
+                                        visual_target_categories_file=config.visual_target_categories_file,
+                                        caption_availability=1.)
 
     # Task details
     task_names = ["Conceptual_Caption"]
@@ -194,6 +207,7 @@ def main():
 
     # Logging
     logdir = os.path.join(args.logdir, timestamp)
+    tb_logger = None
     if default_gpu:
         tb_logger = tbLogger(logdir, save_path, task_names, task_ids, task2num_iters, args.grad_acc_steps)
 
@@ -257,11 +271,14 @@ def main():
         resume(args.resume_file, model, optimizer, scheduler, tb_logger)
 
     # Move to GPU(s)
-    model.cuda()
+    #model.cuda()
+    device = torch.cuda.current_device()
+    model.to(device)
     for state in optimizer.state.values():
         for k, v in state.items():
             if torch.is_tensor(v):
-                state[k] = v.cuda()
+                #state[k] = v.cuda()
+                state[k] = v.to(device)
     if args.local_rank != -1:
         try:
             from apex.parallel import DistributedDataParallel as DDP
@@ -284,14 +301,18 @@ def main():
         logger.info("  Batch size = %d", args.train_batch_size)
         logger.info("  Num steps = %d", num_train_optimization_steps)
 
+    add_domain_confusion_loss = False
     if args.objective == 3 or args.objective == 4:
         add_domain_confusion_loss = True
-        if isinstance(model, torch.nn.DataParallel):
+
+    if config.v_use_language_prototypes:
+        if isinstance(model, torch.nn.DataParallel) or isinstance(model, DDP):
             model.module.update_v_prototypes((train_dataset.preprocess_function.vis_category_to_tokenIds,
                                               train_dataset.preprocess_function.vis_att_category_to_tokenIds))
         else:
             model.update_v_prototypes((train_dataset.preprocess_function.vis_category_to_tokenIds,
                                        train_dataset.preprocess_function.vis_att_category_to_tokenIds))
+
     # Train
     for epoch_id in tqdm(range(start_epoch, int(args.num_train_epochs))):
         model.train()
@@ -300,15 +321,15 @@ def main():
             iter_id = start_iter_id + step + (epoch_id * len(train_dataset))
             batch = tuple(torch.tensor(t, device=device) for t in batch[:-1])
             #batch = tuple(t.cuda(device=device, non_blocking=True) for t in batch[:-1])
-            if len(batch) == 15:
+            if len(batch) == 16:
                 input_ids, input_mask, segment_ids, lm_label_ids, is_match, \
                 image_feat, image_loc, image_cls, obj_labels, obj_confs, \
-                attr_labels, attr_confs, image_attrs, image_label, image_mask = batch
-            elif len(batch) == 17:
+                attr_labels, attr_confs, image_attrs, image_label, image_mask, caption_avail = batch
+            elif len(batch) == 18:
                 input_ids, input_mask, segment_ids, lm_label_ids, is_match, \
                 image_feat, image_loc, image_cls, obj_labels, obj_confs, \
                 attr_labels, attr_confs, image_attrs, image_label, image_mask, \
-                obj_tokens, attr_tokens = batch
+                obj_tokens, attr_tokens, caption_avail = batch
             else:
                 raise ValueError
 
@@ -320,27 +341,34 @@ def main():
                 lm_label_ids[lm_label_ids == 0] = -1
 
             masked_loss_t, masked_loss_v, pair_match_loss, discriminator_loss_t, discriminator_loss_v, \
-            multilabel_loss_t, multilabel_loss_v = \
+            multilabel_loss_t, multilabel_loss_v, kl_entropy_t, kl_entropy_v = \
                 model(input_ids, image_feat, image_loc, segment_ids, input_mask, image_mask, lm_label_ids, image_label,
-                      image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs, is_match, False,
+                      image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs, is_match, caption_avail, False,
                       add_domain_confusion_loss=add_domain_confusion_loss,
                       add_multi_label_loss_t=args.add_multi_label_loss_t,
-                      add_multi_label_loss_v=args.add_multi_label_loss_v)
+                      add_multi_label_loss_v=args.add_multi_label_loss_v,
+                      add_kl_entropy_reg=args.add_kl_entropy_reg)
 
             if args.objective == 2:
                 pair_match_loss = pair_match_loss * 0
 
-            if args.objective == 3 or args.objective == 4:
+            loss = masked_loss_t + masked_loss_v
+            if args.objective == 3:
+                loss += (pair_match_loss + config.adversarial_weight * (discriminator_loss_t + discriminator_loss_v))
+            elif args.objective == 4:
                 pair_match_loss = pair_match_loss.detach()
-                loss = masked_loss_t + masked_loss_v + discriminator_loss_t + discriminator_loss_v
+                loss += config.adversarial_weight * (discriminator_loss_t + discriminator_loss_v)
             else:
-                loss = masked_loss_t + masked_loss_v + pair_match_loss
+                loss += pair_match_loss
 
             if args.add_multi_label_loss_t:
                 loss += multilabel_loss_t
 
             if args.add_multi_label_loss_v:
                 loss += multilabel_loss_v
+
+            if args.add_kl_entropy_reg:
+                loss += config.kl_entropy_weight * (kl_entropy_t + kl_entropy_v)
 
             if n_gpu > 1:
                 loss = loss.mean()
@@ -354,6 +382,9 @@ def main():
                     multilabel_loss_t = multilabel_loss_t.mean()
                 if args.add_multi_label_loss_v:
                     multilabel_loss_v = multilabel_loss_v.mean()
+                if args.add_kl_entropy_reg:
+                    kl_entropy_t = kl_entropy_t.mean()
+                    kl_entropy_v = kl_entropy_v.mean()
 
             if args.grad_acc_steps > 1:
                 loss = loss / args.grad_acc_steps
@@ -373,15 +404,16 @@ def main():
                 # Now it's time to confuse the discriminator
                 # discriminator's weights are to be frozen while the transformer encoders' are trained
                 conf_discriminator_loss_t, conf_discriminator_loss_v = 0, 0
-                if args.objective == 3 or args.objective == 4:
-                    if isinstance(model, torch.nn.DataParallel):
+                if config.v_use_language_prototypes:
+                    if isinstance(model, torch.nn.DataParallel) or isinstance(model, DDP):
                         model.module.update_v_prototypes((train_dataset.preprocess_function.vis_category_to_tokenIds,
                                                           train_dataset.preprocess_function.vis_att_category_to_tokenIds))
                     else:
                         model.update_v_prototypes((train_dataset.preprocess_function.vis_category_to_tokenIds,
                                                    train_dataset.preprocess_function.vis_att_category_to_tokenIds))
 
-                    if isinstance(model, torch.nn.DataParallel):
+                if args.objective == 3 or args.objective == 4:
+                    if isinstance(model, torch.nn.DataParallel) or isinstance(model, DDP):
                         model.module.freeze_discriminator(args.freeze_bert)
                     else:
                         model.freeze_discriminator(args.freeze_bert)
@@ -392,20 +424,21 @@ def main():
                         input_ids, input_mask, segment_ids, lm_label_ids, is_match, \
                         image_feat, image_loc, image_cls, obj_labels, obj_confs, \
                         attr_labels, attr_confs, image_attrs, image_label, image_mask, \
-                        obj_tokens, attr_tokens = prev_batch
+                        obj_tokens, attr_tokens, caption_avail = prev_batch
 
-                        # Ignore labels (setting them to -1) for mismatched caption-image pairs
-                        image_label = image_label * (is_match == 0).long().unsqueeze(1)
-                        image_label[image_label == 0] = -1
-                        lm_label_ids = lm_label_ids * (is_match == 0).long().unsqueeze(1)
-                        lm_label_ids[lm_label_ids == 0] = -1
+                        if args.objective == 1 or args.objective == 3 or args.objective == 4:
+                            # Ignore labels (setting them to -1) for mismatched caption-image pairs
+                            image_label = image_label * (is_match == 0).long().unsqueeze(1)
+                            image_label[image_label == 0] = -1
+                            lm_label_ids = lm_label_ids * (is_match == 0).long().unsqueeze(1)
+                            lm_label_ids[lm_label_ids == 0] = -1
 
                         conf_discriminator_loss_t, conf_discriminator_loss_v = \
                             model(input_ids, image_feat, image_loc, segment_ids, input_mask, image_mask, lm_label_ids,
                                   image_label, image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs,
-                                  is_match, False, add_domain_confusion_loss=add_domain_confusion_loss,
+                                  is_match, caption_avail, False, add_domain_confusion_loss=add_domain_confusion_loss,
                                   confuse_discriminator_only=True)
-                        loss = conf_discriminator_loss_t + conf_discriminator_loss_v
+                        loss = config.adversarial_weight * (conf_discriminator_loss_t + conf_discriminator_loss_v)
                         if n_gpu > 1:
                             loss = loss.mean()
                             conf_discriminator_loss_t = conf_discriminator_loss_t.mean()
@@ -418,7 +451,7 @@ def main():
                     optimizer.step()
                     optimizer.zero_grad()
 
-                    if isinstance(model, torch.nn.DataParallel):
+                    if isinstance(model, torch.nn.DataParallel) or isinstance(model, DDP):
                         model.module.defreeze_discriminator(args.freeze_bert)
                     else:
                         model.defreeze_discriminator(args.freeze_bert)
@@ -430,6 +463,7 @@ def main():
                                             discriminator_loss_t, discriminator_loss_v,
                                             conf_discriminator_loss_t, conf_discriminator_loss_v,
                                             multilabel_loss_t, multilabel_loss_v,
+                                            kl_entropy_t, kl_entropy_v,
                                             optimizer.param_groups[0]["lr"], "TASK0", "train", plotline=plotline)
 
                 prev_batches = []
@@ -444,38 +478,45 @@ def main():
         model.eval()
         for step, batch in tqdm(enumerate(valid_dataset)):
             batch = tuple(t.cuda(device=device, non_blocking=True) for t in batch[:-1])
-            if len(batch) == 15:
+            if len(batch) == 16:
                 input_ids, input_mask, segment_ids, lm_label_ids, is_match, \
                 image_feat, image_loc, image_cls, obj_labels, obj_confs, \
-                attr_labels, attr_confs, image_attrs, image_label, image_mask = batch
-            elif len(batch) == 17:
+                attr_labels, attr_confs, image_attrs, image_label, image_mask, caption_avail = batch
+            elif len(batch) == 18:
                 input_ids, input_mask, segment_ids, lm_label_ids, is_match, \
                 image_feat, image_loc, image_cls, obj_labels, obj_confs, \
                 attr_labels, attr_confs, image_attrs, image_label, image_mask, \
-                obj_tokens, attr_tokens = batch
+                obj_tokens, attr_tokens, caption_avail = batch
             else:
                 raise ValueError
 
             batch_size = input_ids.size(0)
             masked_loss_t, masked_loss_v, pair_match_loss, discriminator_loss_t, discriminator_loss_v,\
-                multilabel_loss_t, multilabel_loss_v = \
+                multilabel_loss_t, multilabel_loss_v, kl_entropy_t, kl_entropy_v = \
                 model(input_ids, image_feat, image_loc, segment_ids, input_mask, image_mask, lm_label_ids, image_label,
-                      image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs, is_match,
+                      image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs, is_match, caption_avail,
                       add_multi_label_loss_t=args.add_multi_label_loss_t,
                       add_multi_label_loss_v=args.add_multi_label_loss_v,
-                      add_domain_confusion_loss=add_domain_confusion_loss)
+                      add_domain_confusion_loss=add_domain_confusion_loss,
+                      add_kl_entropy_reg=args.add_kl_entropy_reg)
 
-            if args.objective == 3 or args.objective == 4:
+            loss = masked_loss_t + masked_loss_v
+            if args.objective == 3:
+                loss += (pair_match_loss + config.adversarial_weight * (discriminator_loss_t + discriminator_loss_v))
+            elif args.objective == 4:
                 pair_match_loss = pair_match_loss.detach()
-                loss = masked_loss_t + masked_loss_v + discriminator_loss_t + discriminator_loss_v
+                loss += config.adversarial_weight * (discriminator_loss_t + discriminator_loss_v)
             else:
-                loss = masked_loss_t + masked_loss_v + pair_match_loss
+                loss += pair_match_loss
 
             if args.add_multi_label_loss_t:
                 loss += multilabel_loss_t
 
             if args.add_multi_label_loss_v:
                 loss += multilabel_loss_v
+
+            if args.add_kl_entropy_reg:
+                loss += config.kl_entropy_weight * (kl_entropy_t + kl_entropy_v)
 
             if n_gpu > 1:
                 loss = loss.mean()
@@ -489,11 +530,15 @@ def main():
                     multilabel_loss_t = multilabel_loss_t.mean()
                 if args.add_multi_label_loss_v:
                     multilabel_loss_v = multilabel_loss_v.mean()
+                if args.add_kl_entropy_reg:
+                    kl_entropy_t = kl_entropy_t.mean()
+                    kl_entropy_v = kl_entropy_v.mean()
 
             if default_gpu:
                 tb_logger.step_val_CC(epoch_id, float(masked_loss_t), float(masked_loss_v), float(pair_match_loss),
                                       float(discriminator_loss_t), float(discriminator_loss_v),
                                       float(multilabel_loss_t), float(multilabel_loss_v),
+                                      float(kl_entropy_t), float(kl_entropy_v),
                                       "TASK0", batch_size, "val")
                 sys.stdout.write("%d / %d \r" % (step, numBatches))
                 sys.stdout.flush()
@@ -503,11 +548,9 @@ def main():
 
         torch.set_grad_enabled(True)
         save(save_path, logger, epoch_id, model, optimizer, scheduler, global_step, tb_logger, default_gpu)
-        gc.collect()
 
     if default_gpu:
         tb_logger.txt_close()
-
 
 if __name__ == "__main__":
     main()
