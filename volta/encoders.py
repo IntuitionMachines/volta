@@ -12,6 +12,7 @@ import logging
 import torch
 from torch import nn
 import torch.nn.functional as F
+import numpy as np
 
 from .embeddings import *
 from .config import BertConfig
@@ -1180,6 +1181,40 @@ class BertForVLTasks(BertPreTrainedModel):
         self.fusion_method = config.fusion_method
         self.apply(self.init_weights)
 
+    @staticmethod
+    def knn(x, y, k=3, last_only=False, discard_nearest=True, has_normalized=False):
+        """Find k_neighbors-nearest neighbor distances from y for each example in a minibatch x.
+        Finds the knn in batch dimension (B) and computes L2 distances in channel dimension (C).
+        :param x: tensor of shape [B, C, ...]
+        :param y: tensor of shape [B', C, ...]
+        :param k: the (k_neighbors+1):th nearest neighbor
+        :param last_only: use only the last knn vs. all of them
+        :param discard_nearest:
+        :return: knn distances of shape [B, k_neighbors, ...] or [B, 1, ...] if last_only
+        """
+        # TODO: check all of this!
+        # trick to conserve memory by not doing redundant broadcasting:
+        if has_normalized:
+            dist_x, dist_y = 1, 1
+        else:
+            dist_x = (x ** 2).sum(1).unsqueeze(1)  # [B, 1, ...]
+            dist_y = (y ** 2).sum(1).unsqueeze(0)  # [1, B', ...]
+        # cross = - 2 * torch.mm(x, y.transpose(0, 1))  # [B, B']
+        cross = -2 * torch.einsum('ac...,bc...->ab...', x, y)  # [B, B', ...]
+        distmat = dist_x + cross + dist_y  # distance matrix between all points x, y
+        distmat = torch.clamp(distmat, 1e-8, 1e+8)  # can have negatives otherwise!
+
+        if discard_nearest:  # don't use the shortest, since it can be the same point
+            knn, _ = torch.topk(distmat, k + 1, dim=1, largest=False)  # [B, k+1, ...]  # TODO: check shape!
+            knn = knn[:, 1:]  # [B, k, ...]
+        else:
+            knn, _ = torch.topk(distmat, k, dim=1, largest=False)  # [B, k, ...]
+
+        if last_only:
+            knn = knn[:, -1:]  # [B, 1, ...]; k_neighbors:th distance only
+
+        return torch.sqrt(knn)
+
     def KLRegularizer(self, x, eps=1e-6, pre_norm=False):
         '''
         Searching NN in one batch to calculate KL loss
@@ -1200,6 +1235,35 @@ class BertForVLTasks(BertPreTrainedModel):
 
         return kl_loss
 
+    def KNN_KLDiv(self, x, y, k=3, eps=1e-8, last_only=False, symmetric=True):
+        """
+        KL divergence K(p|q) estimator for batches x~p(x), y~q(y).
+        Note: important to use x as the prediction/ network out and y as the target, because only then the entropy
+        contribution is included in the gradient.
+
+        :param x: prediction; shape [B, C, ...]
+        :param y: target; shape [B, C, ...]
+        :param k:
+        :return: scalar
+        """
+
+        if isinstance(x, np.ndarray):
+            x = torch.tensor(x.astype(np.float32))
+            y = torch.tensor(y.astype(np.float32))
+
+        has_normalized = True if self.config.normalize_pooler_act else False
+        nns_xx = self.knn(x, x, k=k, last_only=last_only, discard_nearest=True, has_normalized=has_normalized)  # [B, k or 1, ...]
+        nns_xy = self.knn(x, y, k=k, last_only=last_only, discard_nearest=True, has_normalized=has_normalized)  # [B, k or 1, ...]
+        if symmetric:
+            nns_yx = self.knn(y, x, k=k, last_only=last_only, discard_nearest=True, has_normalized=has_normalized)
+            nns_yy = self.knn(y, y, k=k, last_only=last_only, discard_nearest=True, has_normalized=has_normalized)
+            divergence = (torch.log(nns_yx + eps) + torch.log(nns_xy + eps) -
+                          torch.log(nns_xx + eps) - torch.log(nns_yy + eps)).mean()
+        else:
+            divergence = (torch.log(nns_xy + eps) - torch.log(nns_xx + eps)).mean()
+
+        return divergence
+
     def forward(
         self,
         input_txt,
@@ -1211,7 +1275,8 @@ class BertForVLTasks(BertPreTrainedModel):
         image_attention_mask=None,
         output_all_encoded_layers=False,
         output_all_attention_masks=False,
-        add_kl_entropy_reg=False
+        add_kl_entropy_reg=False,
+        add_kl_dist_matching=False
     ):
 
         sequence_output_t, sequence_output_v, pooled_output_t, pooled_output_v, all_attention_mask = self.bert(
@@ -1231,6 +1296,12 @@ class BertForVLTasks(BertPreTrainedModel):
             pooled_output_t = F.normalize(pooled_output_t, dim=-1)
             pooled_output_v = F.normalize(pooled_output_v, dim=-1)
             pre_norm = True
+
+        if add_kl_dist_matching:
+            knn_kldiv = self.KNN_KLDiv(sequence_output_v[:, 0], sequence_output_t[:, 0], k=self.config.knn,
+                                       symmetric=True)
+        else:
+            knn_kldiv = torch.zeros(1).cuda()
 
         if add_kl_entropy_reg:
             kl_entropy_t = self.KLRegularizer(pooled_output_t, pre_norm)
@@ -1270,4 +1341,6 @@ class BertForVLTasks(BertPreTrainedModel):
         else:
             vil_prediction = self.clfs_dict[task_id](pooled_output)
 
-        return vil_prediction, vision_prediction, linguisic_prediction, all_attention_mask, kl_entropy_t, kl_entropy_v
+        return vil_prediction, vision_prediction, linguisic_prediction, all_attention_mask, kl_entropy_t, kl_entropy_v, \
+               knn_kldiv
+

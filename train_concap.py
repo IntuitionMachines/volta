@@ -53,6 +53,8 @@ def parse_args():
                         help="The config file which specified the model details.")
     parser.add_argument("--resume_file", default="", type=str,
                         help="Resume from checkpoint")
+    parser.add_argument("--resume_from_next_epoch", action="store_true")
+
     # Output
     parser.add_argument("--output_dir", default="checkpoints", type=str,
                         help="The output directory where the model checkpoints will be written.")
@@ -102,6 +104,8 @@ def parse_args():
     parser.add_argument("--add_multi_label_loss_t", action="store_true")
     parser.add_argument("--add_multi_label_loss_v", action="store_true")
     parser.add_argument("--add_kl_entropy_reg", action="store_true")
+    parser.add_argument("--add_kl_dist_matching", action="store_true")
+    parser.add_argument("--add_gradient_penalty", action="store_true")
     parser.add_argument("--aligned_pairs_proportion", default=1.0, type=float,
                         help="how much proportion of aligned data will be used in training")
 
@@ -156,9 +160,10 @@ def main():
     now = datetime.datetime.fromtimestamp(time.time()).strftime('-%Y-%m%d-%H-%M')
     timestamp = args.config_file.split("/")[1].split(".")[0] + now
     save_path = os.path.join(args.output_dir, timestamp)
-    if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
+
     if default_gpu:
+        if not os.path.exists(args.output_dir):
+            os.makedirs(args.output_dir)
         if not os.path.exists(save_path):
             os.makedirs(save_path)
         # save all the hidden parameters.
@@ -268,7 +273,8 @@ def main():
 
     # Resume training
     start_iter_id, global_step, start_epoch, tb_logger, _ = \
-        resume(args.resume_file, model, optimizer, scheduler, tb_logger)
+        resume(args.resume_file, model, optimizer, scheduler, tb_logger,
+               resume_from_next_epoch=args.resume_from_next_epoch)
 
     # Move to GPU(s)
     #model.cuda()
@@ -321,6 +327,7 @@ def main():
             iter_id = start_iter_id + step + (epoch_id * len(train_dataset))
             batch = tuple(torch.tensor(t, device=device) for t in batch[:-1])
             #batch = tuple(t.cuda(device=device, non_blocking=True) for t in batch[:-1])
+
             if len(batch) == 16:
                 input_ids, input_mask, segment_ids, lm_label_ids, is_match, \
                 image_feat, image_loc, image_cls, obj_labels, obj_confs, \
@@ -333,33 +340,41 @@ def main():
             else:
                 raise ValueError
 
-            if args.objective == 1 or args.objective == 3 or args.objective == 4:
+            if (args.objective == 1 or args.objective == 3 or args.objective == 4) and \
+                    config.image_embeddings != 'mix_uniter':
                 # Ignore labels (setting them to -1) for mismatched caption-image pairs
+
+                # The vision and text streams are anyway processed separately, so
+                # no need to mask the label with "mix_uniter" embedding
                 image_label = image_label * (is_match == 0).long().unsqueeze(1)
                 image_label[image_label == 0] = -1
                 lm_label_ids = lm_label_ids * (is_match == 0).long().unsqueeze(1)
                 lm_label_ids[lm_label_ids == 0] = -1
 
             masked_loss_t, masked_loss_v, pair_match_loss, discriminator_loss_t, discriminator_loss_v, \
-            multilabel_loss_t, multilabel_loss_v, kl_entropy_t, kl_entropy_v = \
+            multilabel_loss_t, multilabel_loss_v, kl_entropy_t, kl_entropy_v, knn_kldiv = \
                 model(input_ids, image_feat, image_loc, segment_ids, input_mask, image_mask, lm_label_ids, image_label,
                       image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs, is_match, caption_avail, False,
                       add_domain_confusion_loss=add_domain_confusion_loss,
                       add_multi_label_loss_t=args.add_multi_label_loss_t,
                       add_multi_label_loss_v=args.add_multi_label_loss_v,
-                      add_kl_entropy_reg=args.add_kl_entropy_reg)
+                      add_kl_entropy_reg=args.add_kl_entropy_reg,
+                      add_kl_dist_matching=args.add_kl_dist_matching)
 
             if args.objective == 2:
                 pair_match_loss = pair_match_loss * 0
 
-            loss = masked_loss_t + masked_loss_v
+            loss = config.masked_loss_t_weight * masked_loss_t + \
+                   config.masked_loss_v_weight * masked_loss_v
+
             if args.objective == 3:
-                loss += (pair_match_loss + config.adversarial_weight * (discriminator_loss_t + discriminator_loss_v))
+                loss += (config.pair_match_loss_weight * pair_match_loss +
+                         config.adversarial_weight * (discriminator_loss_t + discriminator_loss_v))
             elif args.objective == 4:
                 pair_match_loss = pair_match_loss.detach()
                 loss += config.adversarial_weight * (discriminator_loss_t + discriminator_loss_v)
             else:
-                loss += pair_match_loss
+                loss += config.pair_match_loss_weight * pair_match_loss
 
             if args.add_multi_label_loss_t:
                 loss += multilabel_loss_t
@@ -369,6 +384,9 @@ def main():
 
             if args.add_kl_entropy_reg:
                 loss += config.kl_entropy_weight * (kl_entropy_t + kl_entropy_v)
+
+            if args.add_kl_dist_matching:
+                loss += config.knn_kl_weight * knn_kldiv
 
             if n_gpu > 1:
                 loss = loss.mean()
@@ -385,6 +403,8 @@ def main():
                 if args.add_kl_entropy_reg:
                     kl_entropy_t = kl_entropy_t.mean()
                     kl_entropy_v = kl_entropy_v.mean()
+                if args.add_kl_dist_matching:
+                    knn_kldiv = knn_kldiv.mean()
 
             if args.grad_acc_steps > 1:
                 loss = loss / args.grad_acc_steps
@@ -426,7 +446,8 @@ def main():
                         attr_labels, attr_confs, image_attrs, image_label, image_mask, \
                         obj_tokens, attr_tokens, caption_avail = prev_batch
 
-                        if args.objective == 1 or args.objective == 3 or args.objective == 4:
+                        if (args.objective == 1 or args.objective == 3 or args.objective == 4) and \
+                                config.image_embeddings != 'mix_uniter':
                             # Ignore labels (setting them to -1) for mismatched caption-image pairs
                             image_label = image_label * (is_match == 0).long().unsqueeze(1)
                             image_label[image_label == 0] = -1
@@ -463,7 +484,7 @@ def main():
                                             discriminator_loss_t, discriminator_loss_v,
                                             conf_discriminator_loss_t, conf_discriminator_loss_v,
                                             multilabel_loss_t, multilabel_loss_v,
-                                            kl_entropy_t, kl_entropy_v,
+                                            kl_entropy_t, kl_entropy_v, knn_kldiv,
                                             optimizer.param_groups[0]["lr"], "TASK0", "train", plotline=plotline)
 
                 prev_batches = []
@@ -472,10 +493,20 @@ def main():
             if (step % (100 * args.grad_acc_steps) == 0) and step != 0 and default_gpu:
                 tb_logger.showLossTrainCC()
 
+            if global_step > 0 and global_step % 10000 == 0:
+                save(save_path, logger, epoch_id, model, optimizer, scheduler, global_step, tb_logger,
+                     default_gpu)
+
         # Do the evaluation
         torch.set_grad_enabled(False)
         numBatches = len(valid_dataset)
         model.eval()
+
+        if dist.is_available() and args.local_rank != -1:
+            epoch_id_adjusted = epoch_id * num_replicas
+        else:
+            epoch_id_adjusted = epoch_id
+
         for step, batch in tqdm(enumerate(valid_dataset)):
             batch = tuple(t.cuda(device=device, non_blocking=True) for t in batch[:-1])
             if len(batch) == 16:
@@ -492,15 +523,17 @@ def main():
 
             batch_size = input_ids.size(0)
             masked_loss_t, masked_loss_v, pair_match_loss, discriminator_loss_t, discriminator_loss_v,\
-                multilabel_loss_t, multilabel_loss_v, kl_entropy_t, kl_entropy_v = \
+                multilabel_loss_t, multilabel_loss_v, kl_entropy_t, kl_entropy_v, knn_kldiv = \
                 model(input_ids, image_feat, image_loc, segment_ids, input_mask, image_mask, lm_label_ids, image_label,
                       image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs, is_match, caption_avail,
                       add_multi_label_loss_t=args.add_multi_label_loss_t,
                       add_multi_label_loss_v=args.add_multi_label_loss_v,
                       add_domain_confusion_loss=add_domain_confusion_loss,
-                      add_kl_entropy_reg=args.add_kl_entropy_reg)
+                      add_kl_entropy_reg=args.add_kl_entropy_reg,
+                      add_kl_dist_matching=args.add_kl_dist_matching)
 
-            loss = masked_loss_t + masked_loss_v
+            loss = config.masked_loss_t_weight * masked_loss_t + \
+                   config.masked_loss_v_weight * masked_loss_v
             if args.objective == 3:
                 loss += (pair_match_loss + config.adversarial_weight * (discriminator_loss_t + discriminator_loss_v))
             elif args.objective == 4:
@@ -518,6 +551,9 @@ def main():
             if args.add_kl_entropy_reg:
                 loss += config.kl_entropy_weight * (kl_entropy_t + kl_entropy_v)
 
+            if args.add_kl_dist_matching:
+                loss += config.knn_kl_weight * knn_kldiv
+
             if n_gpu > 1:
                 loss = loss.mean()
                 masked_loss_t = masked_loss_t.mean()
@@ -533,12 +569,14 @@ def main():
                 if args.add_kl_entropy_reg:
                     kl_entropy_t = kl_entropy_t.mean()
                     kl_entropy_v = kl_entropy_v.mean()
+                if args.add_kl_dist_matching:
+                    knn_kldiv = knn_kldiv.mean()
 
             if default_gpu:
-                tb_logger.step_val_CC(epoch_id, float(masked_loss_t), float(masked_loss_v), float(pair_match_loss),
+                tb_logger.step_val_CC(epoch_id_adjusted, float(masked_loss_t), float(masked_loss_v), float(pair_match_loss),
                                       float(discriminator_loss_t), float(discriminator_loss_v),
                                       float(multilabel_loss_t), float(multilabel_loss_v),
-                                      float(kl_entropy_t), float(kl_entropy_v),
+                                      float(kl_entropy_t), float(kl_entropy_v), float(knn_kldiv),
                                       "TASK0", batch_size, "val")
                 sys.stdout.write("%d / %d \r" % (step, numBatches))
                 sys.stdout.flush()
@@ -547,7 +585,7 @@ def main():
             tb_logger.showLossValCC()
 
         torch.set_grad_enabled(True)
-        save(save_path, logger, epoch_id, model, optimizer, scheduler, global_step, tb_logger, default_gpu)
+        save(save_path, logger, epoch_id_adjusted, model, optimizer, scheduler, global_step, tb_logger, default_gpu)
 
     if default_gpu:
         tb_logger.txt_close()

@@ -86,6 +86,7 @@ def parse_args():
                              "It overwrites --warmup_proportion.")
     # Objectives
     parser.add_argument("--add_kl_entropy_reg", default=False, action="store_true")
+    parser.add_argument("--add_kl_dist_matching", default=False, action="store_true")
     parser.add_argument("--kl_w", type=float, default=1.0,
                         help="kl_entropy_reg weight")
 
@@ -295,12 +296,17 @@ def main():
         len_dl_train = len(dl_train)
         for step, batch in tqdm(enumerate(dl_train)):
             iter_id = start_iter_id + step + (epoch_id * len_dl_train)
-            loss, kl_entropy_t, kl_entropy_v, score = ForwardModelsTrain(config, task_cfg, device, task, batch, model,
-                                                                         criterion, add_kl_entropy_reg=args.add_kl_entropy_reg)
+            loss, kl_entropy_t, kl_entropy_v, knn_kldiv, score = ForwardModelsTrain(config, task_cfg, device, task,
+                                                                                    batch, model,
+                                                                                    criterion,
+                                                                                    add_kl_entropy_reg=args.add_kl_entropy_reg,
+                                                                                    add_kl_dist_matching=args.add_kl_dist_matching)
             #if n_gpu > 1:
             kl_entropy_t = kl_entropy_t.mean()
             kl_entropy_v = kl_entropy_v.mean()
+            knn_kldiv = knn_kldiv.mean()
 
+            loss += config.knn_kl_weight * knn_kldiv
             loss += args.kl_w * (kl_entropy_t + kl_entropy_v)
             if args.grad_acc_steps > 1:
                 loss = loss / args.grad_acc_steps
@@ -320,7 +326,7 @@ def main():
 
                 if default_gpu:
                     plotline = step % (20 * args.grad_acc_steps) == 0
-                    tb_logger.step_train(epoch_id, iter_id, loss, kl_entropy_t, kl_entropy_v, score,
+                    tb_logger.step_train(epoch_id, iter_id, loss, kl_entropy_t, kl_entropy_v, knn_kldiv, score,
                                          optimizer.param_groups[0]["lr"], task, "train", plotline=plotline)
 
             if (step % (100 * args.grad_acc_steps) == 0) and step != 0 and default_gpu:

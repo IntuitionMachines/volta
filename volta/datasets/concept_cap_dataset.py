@@ -14,6 +14,7 @@ import tensorpack.dataflow as td
 
 import torch
 import torch.distributed as dist
+from datasets import load_dataset
 
 import msgpack_numpy
 msgpack_numpy.patch()
@@ -229,7 +230,8 @@ class ConceptCapLoaderTrain(object):
             objective=objective,
             num_locs=num_locs,
             visual_target_categories_file=visual_target_categories_file,
-            caption_availability=self.caption_availability_dict
+            caption_availability=self.caption_availability_dict,
+            ext_corpus=['bookcorpus']
         )
 
         ds = td.PrefetchData(ds, 10000, 1)
@@ -511,7 +513,8 @@ class BertPreprocessBatch(object):
             objective=0,
             num_locs=5,
             visual_target_categories_file=None,
-            caption_availability={}
+            caption_availability={},
+            ext_corpus=[],
     ):
 
         self.split = split
@@ -519,7 +522,10 @@ class BertPreprocessBatch(object):
         self.region_len = region_len
         self.tokenizer = tokenizer
         self.num_caps = data_size
+        # todo: add captions from other corpus here
         self.captions = list(json.load(open(caption_path, "r")).values())
+        self._add_captions(ext_corpus)
+
         self.visualization = visualization
         self.objective = objective
         self.bert_model = bert_model
@@ -537,6 +543,16 @@ class BertPreprocessBatch(object):
         attr_tokens = [self.vis_att_category_to_tokenIds[i] for i in attr_labels]
 
         return obj_tokens, attr_tokens
+
+    def _add_captions(self, datasets, num=2500000):
+        for ds in datasets:
+            logger.info('sampling {} sentences from {}'.format(num, ds))
+            self.captions += random.choices(load_dataset(ds)['train']['text'], k=num)
+            logger.info('sampled {} sentences from {}'.format(num, ds))
+
+        # update num of captions
+        self.num_caps = len(self.captions)
+        logger.info('total number of captions becomes {}'.format(self.num_caps))
 
     def __call__(self, data):
         image_feature_wp, image_cls_wp, obj_labels, obj_confs, attr_labels, attr_confs, attr_scores, \
@@ -578,7 +594,7 @@ class BertPreprocessBatch(object):
         image_location[:, 2] = image_location[:, 2] / float(image_w)
         image_location[:, 3] = image_location[:, 3] / float(image_h)
 
-        caption, label = self.random_cap(caption)
+        caption, label = self.random_cap(caption, caption_avail_label)
         tokens_caption = self.tokenizer.encode(caption)
 
         example = dict(image_feat=image_feature,
@@ -681,27 +697,29 @@ class BertPreprocessBatch(object):
                 self.vis_att_category_to_tokenIds.append(out_tokens)
             self.vis_att_category_to_tokenIds = np.array(self.vis_att_category_to_tokenIds)
 
-    def random_cap(self, caption):
+    def random_cap(self, caption, caption_avail_label=None):
         """
         Get one sample from corpus consisting of two sentences. With prob. 50% these are two subsequent sentences
         from one doc. With 50% the second sentence will be a random one from another doc.
+
+        (updates): now aligned pairs are labeled as 1 and 0 for not aligned pairs
         :param index: int, index of sample.
         :return: (str, str, int), sentence 1, sentence 2, isNextSentence Label
         """
 
         if self.visualization:
-            return caption, 0
+            return caption, 1
 
         if (self.objective == 0 or self.objective == 1 or self.objective == 3) and random.random() > 0.5:
             caption = self.get_random_caption()
-            label = 1
+            label = 0
         elif self.objective == 4:
             # objective 4, always sample negative pairs
             caption = self.get_random_caption()
-            label = 1
+            label = 0
         else:
             # objective 2, do not sample negative pairs
-            label = 0
+            label = 1
 
         return caption, label
 
@@ -713,7 +731,6 @@ class BertPreprocessBatch(object):
         # add the hard negative mining objective here.
         rand_doc_idx = random.randint(0, self.num_caps - 1)
         caption = self.captions[rand_doc_idx]
-
         return caption
 
     def convert_example_to_features(self, example, max_seq_length, tokenizer, max_region_length):

@@ -193,7 +193,7 @@ def main():
                 ] = (target.view(-1).float().cpu().numpy())
 
             else:
-                vil_logit, _, _, _, _, _ = model(question, features, spatials, task, segment_ids, input_mask, image_mask)
+                vil_logit, _, _, _, _, _, _ = model(question, features, spatials, task, segment_ids, input_mask, image_mask)
 
                 score_matrix[
                     caption_idx, image_idx * 500: (image_idx + 1) * 500
@@ -221,7 +221,7 @@ def main():
                 meanr = np.mean(rank_matrix_tmp) + 1
                 print(
                     "%d Final r1:%.3f, r5:%.3f, r10:%.3f, mder:%.3f, meanr:%.3f"
-                    % (count, r1, r5, r10, medr, meanr)
+                    % (count, r1, r5, r10, medr, meanr), flush=True
                 )
 
                 results.append(np.argsort(-score_matrix[caption_idx]).tolist()[:20])

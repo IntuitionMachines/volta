@@ -12,6 +12,7 @@ import logging
 import torch
 from torch import nn
 import torch.nn.functional as F
+import numpy as np
 
 from .embeddings import *
 from .config import BertConfig
@@ -792,18 +793,18 @@ class BertImagePredictionHead(nn.Module):
 class Discriminator(nn.Module):
     def __init__(self, config):
         super(Discriminator, self).__init__()
-        #self.dense1 = nn.Linear(config.v_hidden_size, config.v_hidden_size)
-        self.dense1 = nn.Linear(config.v_pooler_size, config.v_pooler_size)
+        self.dense1 = nn.Linear(config.v_hidden_size, config.v_hidden_size)
+        #self.dense1 = nn.Linear(config.v_pooler_size, config.v_pooler_size)
         self.v_intermediate_act_fn = ACT2FN[config.v_hidden_act]
 
         self.dropout = nn.Dropout(0.1)
-        #self.dense2 = nn.Linear(config.v_hidden_size, 1)
-        self.dense2 = nn.Linear(config.v_pooler_size, 1)
+        self.dense2 = nn.Linear(config.v_hidden_size, 1)
+        #self.dense2 = nn.Linear(config.v_pooler_size, 1)
 
     def forward(self, hidden_states):
-        hidden_states = self.dense1(hidden_states)
-        hidden_states = self.v_intermediate_act_fn(hidden_states)
-        hidden_states = self.dropout(hidden_states)
+        #hidden_states = self.dense1(hidden_states)
+        #hidden_states = self.v_intermediate_act_fn(hidden_states)
+        #hidden_states = self.dropout(hidden_states)
         hidden_states = self.dense2(hidden_states)
 
         return hidden_states
@@ -873,10 +874,10 @@ class BertPreTrainingHeads(nn.Module):
             prediction_scores_v_dict = self.imagePredictions(sequence_output_v)
 
         if discriminator_only or output_discriminator_score:
-            #discriminator_score_t = self.discriminator(sequence_output_t)
-            #discriminator_score_v = self.discriminator(sequence_output_v)
-            discriminator_score_t = self.discriminator(pooled_output_t)
-            discriminator_score_v = self.discriminator(pooled_output_v)
+            discriminator_score_t = self.discriminator(sequence_output_t[:, 0])
+            discriminator_score_v = self.discriminator(sequence_output_v[:, 0])
+            #discriminator_score_t = self.discriminator(pooled_output_t)
+            #discriminator_score_v = self.discriminator(pooled_output_v)
             discriminator_score_t = self.sigmoid(discriminator_score_t)
             discriminator_score_v = self.sigmoid(discriminator_score_v)
 
@@ -1132,8 +1133,14 @@ class BertModel(BertPreTrainedModel):
                 pooled_output_t = self.t_pooler(sequence_output_t, text_end)
             else:
                 pooled_output_t = self.t_pooler(sequence_output_t)
+
+            if self.config.normalize_pooler_act:
+                pooled_output_t = F.normalize(pooled_output_t, dim=-1)
+
         elif input_type == 'visual':
             pooled_output_v = self.v_pooler(sequence_output_v)
+            if self.config.normalize_pooler_act:
+                pooled_output_v = F.normalize(pooled_output_v, dim=-1)
 
         if not output_all_encoded_layers:
             encoded_layers_t = encoded_layers_t[-1]
@@ -1160,6 +1167,7 @@ class BertForVLPreTraining(BertPreTrainedModel):
 
         self.add_global_imgfeat = int(config.add_global_imgfeat is not None)
         self.tie_weights()
+        self.config = config
 
     def _smooth_label(self, x, alpha=None):
         '''
@@ -1173,6 +1181,40 @@ class BertForVLPreTraining(BertPreTrainedModel):
         if alphas is None:
             alphas = (num_ones / num_classes).unsqueeze(1)
         return (1 - alphas) * x + alphas / num_classes
+
+    @staticmethod
+    def knn(x, y, k=3, last_only=False, discard_nearest=True, has_normalized=False):
+        """Find k_neighbors-nearest neighbor distances from y for each example in a minibatch x.
+        Finds the knn in batch dimension (B) and computes L2 distances in channel dimension (C).
+        :param x: tensor of shape [B, C, ...]
+        :param y: tensor of shape [B', C, ...]
+        :param k: the (k_neighbors+1):th nearest neighbor
+        :param last_only: use only the last knn vs. all of them
+        :param discard_nearest:
+        :return: knn distances of shape [B, k_neighbors, ...] or [B, 1, ...] if last_only
+        """
+        # TODO: check all of this!
+        # trick to conserve memory by not doing redundant broadcasting:
+        if has_normalized:
+            dist_x, dist_y = 1, 1
+        else:
+            dist_x = (x ** 2).sum(1).unsqueeze(1)  # [B, 1, ...]
+            dist_y = (y ** 2).sum(1).unsqueeze(0)  # [1, B', ...]
+        # cross = - 2 * torch.mm(x, y.transpose(0, 1))  # [B, B']
+        cross = -2 * torch.einsum('ac...,bc...->ab...', x, y)  # [B, B', ...]
+        distmat = dist_x + cross + dist_y  # distance matrix between all points x, y
+        distmat = torch.clamp(distmat, 1e-8, 1e+8)  # can have negatives otherwise!
+
+        if discard_nearest:  # don't use the shortest, since it can be the same point
+            knn, _ = torch.topk(distmat, k + 1, dim=1, largest=False)  # [B, k+1, ...]  # TODO: check shape!
+            knn = knn[:, 1:]  # [B, k, ...]
+        else:
+            knn, _ = torch.topk(distmat, k, dim=1, largest=False)  # [B, k, ...]
+
+        if last_only:
+            knn = knn[:, -1:]  # [B, 1, ...]; k_neighbors:th distance only
+
+        return torch.sqrt(knn)
 
     def KLRegularizer(self, x, eps=1e-6):
         '''
@@ -1193,6 +1235,35 @@ class BertForVLPreTraining(BertPreTrainedModel):
 
         return kl_loss
 
+    def KNN_KLDiv(self, x, y, k=3, eps=1e-8, last_only=False, symmetric=True):
+        """
+        KL divergence K(p|q) estimator for batches x~p(x), y~q(y).
+        Note: important to use x as the prediction/ network out and y as the target, because only then the entropy
+        contribution is included in the gradient.
+
+        :param x: prediction; shape [B, C, ...]
+        :param y: target; shape [B, C, ...]
+        :param k:
+        :return: scalar
+        """
+
+        if isinstance(x, np.ndarray):
+            x = torch.tensor(x.astype(np.float32))
+            y = torch.tensor(y.astype(np.float32))
+
+        has_normalized = True if self.config.normalize_pooler_act else False
+        nns_xx = self.knn(x, x, k=k, last_only=last_only, discard_nearest=True, has_normalized=has_normalized)  # [B, k or 1, ...]
+        nns_xy = self.knn(x, y, k=k, last_only=last_only, discard_nearest=True, has_normalized=has_normalized)  # [B, k or 1, ...]
+        if symmetric:
+            nns_yx = self.knn(y, x, k=k, last_only=last_only, discard_nearest=True, has_normalized=has_normalized)
+            nns_yy = self.knn(y, y, k=k, last_only=last_only, discard_nearest=True, has_normalized=has_normalized)
+            divergence = (torch.log(nns_yx + eps) + torch.log(nns_xy + eps) -
+                          torch.log(nns_xx + eps) - torch.log(nns_yy + eps)).mean()
+        else:
+            divergence = (torch.log(nns_xy + eps) - torch.log(nns_xx + eps)).mean()
+
+        return divergence
+
     def update_v_prototypes(self, v_prototypes):
         v_categories_to_tokens, v_attr_categories_to_tokens = v_prototypes
 
@@ -1202,7 +1273,7 @@ class BertForVLPreTraining(BertPreTrainedModel):
             v_weight = self.cls.imagePredictions.decoder_dict[ix].weight
             v_bias = self.cls.imagePredictions.decoder_dict[ix].bias
             for i, l_tokens in enumerate(v_categories_to_tokens):
-                nonzero_ind = l_tokens[l_tokens != 0]
+                nonzero_ind = l_tokens[np.nonzero(l_tokens)[0]]
                 n_nonzero_ind = len(nonzero_ind)
                 v_weight.data[i] = t_weight[nonzero_ind].sum(dim=0).data.clone() / n_nonzero_ind
                 v_bias.data[i] = t_bias[nonzero_ind].sum(dim=0).data.clone() / n_nonzero_ind
@@ -1254,7 +1325,8 @@ class BertForVLPreTraining(BertPreTrainedModel):
         add_multi_label_loss_t=False,
         add_multi_label_loss_v=False,
         confuse_discriminator_only=False,
-        add_kl_entropy_reg=False
+        add_kl_entropy_reg=False,
+        add_kl_dist_matching=False,
     ):
         # separately feed visual and language inputs to the same model
         # feed visual part
@@ -1276,6 +1348,13 @@ class BertForVLPreTraining(BertPreTrainedModel):
 
         cls_outputs = self.cls(sequence_output_t, sequence_output_v, pooled_output_t, pooled_output_v,
                                add_domain_confusion_loss, confuse_discriminator_only)
+
+        if add_kl_dist_matching:
+            #knn_kldiv = self.KNN_KLDiv(pooled_output_v, pooled_output_t, k=self.config.knn, symmetric=False)
+            knn_kldiv = self.KNN_KLDiv(sequence_output_v[:, 0], sequence_output_t[:, 0], k=self.config.knn, symmetric=True)
+        else:
+            knn_kldiv = torch.zeros(1).cuda()
+
         if add_domain_confusion_loss:
             # first forward
             prediction_scores_t, prediction_scores_v_dict, seq_relationship_score, pooled_output, \
@@ -1283,7 +1362,6 @@ class BertForVLPreTraining(BertPreTrainedModel):
         else:
             prediction_scores_t, prediction_scores_v_dict, seq_relationship_score, pooled_output = cls_outputs
 
-        discriminator_loss_t, discriminator_loss_v = 0, 0
         if confuse_discriminator_only:
             device = discriminator_score_t.device
             conf_discriminator_loss_t = self.loss_bce(discriminator_score_t,
@@ -1352,13 +1430,14 @@ class BertForVLPreTraining(BertPreTrainedModel):
 
             if (seq_relationship_score is not None) and (next_sentence_label is not None):
                 if self.config.fusion_method == 'diff_sq':
-                    pos = torch.mean(seq_relationship_score * (1 - next_sentence_label))
-                    neg = torch.mean(seq_relationship_score * next_sentence_label)
-                    next_sentence_loss = pos - neg
+                    pos = seq_relationship_score * next_sentence_label
+                    neg = seq_relationship_score * (1 - next_sentence_label)
+                    next_sentence_loss = (pos - neg).mean().unsqueeze(0)
                 else:
-                    next_sentence_neg_entries = torch.where(next_sentence_label == 0)[0]
+                    # take indices of negative pairs
+                    #next_sentence_neg_entries = torch.where(next_sentence_label == 0)[0]
                     next_sentence_label[torch.where(caption_avail == 0)[0]] = -1
-                    next_sentence_label[next_sentence_neg_entries] = 0  # keep the entries which are zero
+                    #next_sentence_label[next_sentence_neg_entries] = 0  # keep the entries which are zero
                     next_sentence_loss = self.loss_fct(
                         seq_relationship_score.view(-1, 2),
                         next_sentence_label.view(-1)
@@ -1379,7 +1458,7 @@ class BertForVLPreTraining(BertPreTrainedModel):
 
         if masked_img_loss or masked_lm_loss or next_sentence_loss:
             return masked_lm_loss, img_loss, next_sentence_loss, discriminator_loss_t, discriminator_loss_v, \
-                   multilabel_loss_t, multilabel_loss_v, kl_entropy_t, kl_entropy_v
+                   multilabel_loss_t, multilabel_loss_v, kl_entropy_t, kl_entropy_v, knn_kldiv
         else:
             return prediction_scores_t, prediction_scores_v_dict, seq_relationship_score, all_attention_mask, pooled_output
 

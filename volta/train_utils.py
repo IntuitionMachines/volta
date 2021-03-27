@@ -33,6 +33,8 @@ class tbLogger(object):
         self.task_loss_tmp = {task_id: 0 for task_id in task_ids}
         self.task_score_tmp = {task_id: 0 for task_id in task_ids}
         self.task_norm_tmp = {task_id: 0 for task_id in task_ids}
+        self.task_knn_kldiv_tmp = {task_id: 0 for task_id in task_ids}
+
         self.task_step = {task_id: 0 for task_id in task_ids}
         self.task_step_tmp = {task_id: 0 for task_id in task_ids}
         self.task_num_iters = task_num_iters
@@ -55,6 +57,7 @@ class tbLogger(object):
         self.multilabel_loss_v = {task_id: 0 for task_id in task_ids}
         self.kl_entropy_t = {task_id: 0 for task_id in task_ids}
         self.kl_entropy_v = {task_id: 0 for task_id in task_ids}
+        self.knn_kldiv = {task_id: 0 for task_id in task_ids}
 
         self.masked_t_loss_val = {task_id: 0 for task_id in task_ids}
         self.masked_v_loss_val = {task_id: 0 for task_id in task_ids}
@@ -65,6 +68,7 @@ class tbLogger(object):
         self.multilabel_loss_val_v = {task_id: 0 for task_id in task_ids}
         self.kl_entropy_val_t = {task_id: 0 for task_id in task_ids}
         self.kl_entropy_val_v = {task_id: 0 for task_id in task_ids}
+        self.knn_kldiv_val = {task_id: 0 for task_id in task_ids}
 
 
     def __getstate__(self):
@@ -97,17 +101,20 @@ class tbLogger(object):
         if self.save_logger:
             self.logger.add_scalar(split + "/" + key, val, step)
 
-    def step_train(self, epochId, stepId, loss, kl_entropy_t, kl_entropy_v, score, norm, task_id, split, plotline=True):
+    def step_train(self, epochId, stepId, loss, kl_entropy_t, kl_entropy_v, knn_kldiv, score, norm, task_id, split, plotline=True):
         loss = self._detach_or_return_zero(loss)
         kl_entropy_t = self._detach_or_return_zero(kl_entropy_t)
         kl_entropy_v = self._detach_or_return_zero(kl_entropy_v)
         score = self._detach_or_return_zero(score)
         norm = self._detach_or_return_zero(norm)
+        knn_kldiv = self._detach_or_return_zero(knn_kldiv)
 
         self.task_loss[task_id] += loss
         self.task_loss_tmp[task_id] += loss
         self.task_score_tmp[task_id] += score
         self.task_norm_tmp[task_id] += norm
+        self.task_knn_kldiv_tmp[task_id] += knn_kldiv
+
         self.task_step[task_id] += self.gradient_accumulation_steps
         self.task_step_tmp[task_id] += self.gradient_accumulation_steps
         self.epochId = epochId
@@ -117,6 +124,7 @@ class tbLogger(object):
             self.linePlot(stepId, loss, split, self.task_id2name[task_id] + "_loss")
             self.linePlot(stepId, score, split, self.task_id2name[task_id] + "_score")
             self.linePlot(stepId, norm, split, self.task_id2name[task_id] + "_norm")
+            self.linePlot(stepId, knn_kldiv, split, self.task_id2name[task_id] + "_knn_kldiv")
             self.linePlot(stepId, kl_entropy_t, split, self.task_id2name[task_id] + "_kl_entropy_t")
             self.linePlot(stepId, kl_entropy_v, split, self.task_id2name[task_id] + "_kl_entropy_v")
 
@@ -125,7 +133,7 @@ class tbLogger(object):
                       discriminator_loss_t, discriminator_loss_v,
                       conf_discriminator_loss_t, conf_discriminator_loss_v,
                       multilabel_loss_t, multilabel_loss_v,
-                      kl_entropy_t, kl_entropy_v,
+                      kl_entropy_t, kl_entropy_v, knn_kldiv,
                       norm, task_id, split, plotline=True):
         masked_loss_t = self._detach_or_return_zero(masked_loss_t)
         masked_loss_v = self._detach_or_return_zero(masked_loss_v)
@@ -138,6 +146,7 @@ class tbLogger(object):
         multilabel_loss_v = self._detach_or_return_zero(multilabel_loss_v)
         kl_entropy_t = self._detach_or_return_zero(kl_entropy_t)
         kl_entropy_v = self._detach_or_return_zero(kl_entropy_v)
+        knn_kldiv = self._detach_or_return_zero(knn_kldiv)
 
         self.masked_t_loss[task_id] += masked_loss_t
         self.masked_v_loss[task_id] += masked_loss_v
@@ -150,6 +159,7 @@ class tbLogger(object):
         self.multilabel_loss_v[task_id] += multilabel_loss_v
         self.kl_entropy_t[task_id] += kl_entropy_t
         self.kl_entropy_v[task_id] += kl_entropy_v
+        self.knn_kldiv[task_id] += knn_kldiv
         self.task_norm_tmp[task_id] += norm
 
         self.task_step[task_id] += self.gradient_accumulation_steps
@@ -167,6 +177,8 @@ class tbLogger(object):
             self.linePlot(stepId, multilabel_loss_v, split, self.task_id2name[task_id] + "_multilabel_loss_v")
             self.linePlot(stepId, kl_entropy_t, split, self.task_id2name[task_id] + "_kl_entropy_t")
             self.linePlot(stepId, kl_entropy_v, split, self.task_id2name[task_id] + "_kl_entropy_v")
+            self.linePlot(stepId, knn_kldiv, split, self.task_id2name[task_id] + "_knn_kldiv")
+            self.linePlot(stepId, norm, split, self.task_id2name[task_id] + "_lr")
             self.linePlot(stepId, conf_discriminator_loss_t, split, self.task_id2name[task_id] + "_conf_disc_loss_t")
             self.linePlot(stepId, conf_discriminator_loss_v, split, self.task_id2name[task_id] + "_conf_disc_loss_v")
 
@@ -182,7 +194,8 @@ class tbLogger(object):
     def step_val_CC(self, epochId, masked_loss_t, masked_loss_v, next_sentence_loss,
                     discriminator_loss_t, discriminator_loss_v,
                     multilabel_loss_t, multilabel_loss_v,
-                    kl_entropy_t, kl_entropy_v, task_id, batch_size, split):
+                    kl_entropy_t, kl_entropy_v, knn_kldiv,
+                    task_id, batch_size, split):
         self.masked_t_loss_val[task_id] += masked_loss_t
         self.masked_v_loss_val[task_id] += masked_loss_v
         self.next_sentense_loss_val[task_id] += next_sentence_loss
@@ -192,6 +205,7 @@ class tbLogger(object):
         self.multilabel_loss_val_v[task_id] += multilabel_loss_v
         self.kl_entropy_val_t[task_id] += kl_entropy_t
         self.kl_entropy_val_v[task_id] += kl_entropy_v
+        self.knn_kldiv_val[task_id] += knn_kldiv
 
         self.task_step_val[task_id] += self.gradient_accumulation_steps
         self.task_datasize_val[task_id] += batch_size
@@ -255,11 +269,12 @@ class tbLogger(object):
             if self.task_num_iters[task_id] > 0:
                 if self.task_step_tmp[task_id]:
                     lossInfo += (
-                        "[%s]: iter %d Ep: %.2f loss %.3f score %.3f lr %.6g "
+                        "[%s]: iter %d Ep: %.2f loss %.3f knnkl %.3f score %.3f lr %.6g "
                         % (
                             self.task_id2name[task_id], self.task_step[task_id],
                             self.task_step[task_id] / float(self.task_num_iters[task_id]),
                             self.task_loss_tmp[task_id] / float(self.task_step_tmp[task_id]),
+                            self.task_knn_kldiv_tmp[task_id] / float(self.task_step_tmp[task_id]),
                             self.task_score_tmp[task_id] / float(self.task_step_tmp[task_id]),
                             self.task_norm_tmp[task_id] / float(self.task_step_tmp[task_id]),
                         )
@@ -272,6 +287,7 @@ class tbLogger(object):
         self.task_loss_tmp = {task_id: 0 for task_id in self.task_ids}
         self.task_score_tmp = {task_id: 0 for task_id in self.task_ids}
         self.task_norm_tmp = {task_id: 0 for task_id in self.task_ids}
+        self.task_knn_kldiv_tmp = {task_id: 0 for task_id in self.task_ids}
 
     def showLossValCC(self):
         lossInfo = "Validation "
@@ -285,7 +301,7 @@ class tbLogger(object):
             multilabel_loss_val_v = self.multilabel_loss_val_v[task_id] / float(self.task_step_val[task_id])
             kl_entropy_val_t = self.kl_entropy_val_t[task_id] / float(self.task_step_val[task_id])
             kl_entropy_val_v = self.kl_entropy_val_v[task_id] / float(self.task_step_val[task_id])
-
+            knn_kldiv_val = self.knn_kldiv_val[task_id] / float(self.task_step_val[task_id])
 
             lossInfo += "[%s]: masked_t %.3f masked_v %.3f NSP %.3f" % (
                 self.task_id2name[task_id],
@@ -303,6 +319,7 @@ class tbLogger(object):
             self.linePlot(self.epochId, multilabel_loss_val_v, "val", self.task_id2name[task_id] + "_multilabel_loss_v")
             self.linePlot(self.epochId, kl_entropy_val_t, "val", self.task_id2name[task_id] + "_kl_entropy_val_t")
             self.linePlot(self.epochId, kl_entropy_val_v, "val", self.task_id2name[task_id] + "_kl_entropy_val_v")
+            self.linePlot(self.epochId, knn_kldiv_val, "val", self.task_id2name[task_id] + "_knn_kldiv_val")
 
         self.masked_t_loss_val = {task_id: 0 for task_id in self.masked_t_loss_val}
         self.masked_v_loss_val = {task_id: 0 for task_id in self.masked_v_loss_val}
@@ -313,6 +330,8 @@ class tbLogger(object):
         self.multilabel_loss_val_v = {task_id: 0 for task_id in self.multilabel_loss_val_v}
         self.kl_entropy_val_t = {task_id: 0 for task_id in self.kl_entropy_val_t}
         self.kl_entropy_val_v = {task_id: 0 for task_id in self.kl_entropy_val_v}
+        self.knn_kldiv_val = {task_id: 0 for task_id in self.knn_kldiv_val}
+
         self.task_datasize_val = {task_id: 0 for task_id in self.task_datasize_val}
         self.task_step_val = {task_id: 0 for task_id in self.task_ids}
 
@@ -328,7 +347,7 @@ class tbLogger(object):
                     lossInfo += (
                         "[%s]: iter %d Ep: %.2f masked_t %.3f masked_v %.3f NSP %.3f lr %.6g disc_t %.3f disc_v %.3f "
                         "ml_loss_t: %.3f ml_loss_v: %.3f "
-                        "kl_entropy_t: %.3f kl_entropy_v: %.3f "
+                        "kl_entropy_t: %.3f kl_entropy_v: %.3f knn_kldiv: %.3f "
                         "conf_disc_t %.3f conf_disc_v %.3f"
                         % (
                             self.task_id2name[task_id], self.task_step[task_id],
@@ -343,6 +362,7 @@ class tbLogger(object):
                             self.multilabel_loss_v[task_id] / float(self.task_step_tmp[task_id]),
                             self.kl_entropy_t[task_id] / float(self.task_step_tmp[task_id]),
                             self.kl_entropy_v[task_id] / float(self.task_step_tmp[task_id]),
+                            self.knn_kldiv[task_id] / float(self.task_step_tmp[task_id]),
                             self.conf_discriminator_loss_t[task_id] / float(self.task_step_tmp[task_id]),
                             self.conf_discriminator_loss_v[task_id] / float(self.task_step_tmp[task_id]),
                         )
@@ -361,6 +381,7 @@ class tbLogger(object):
         self.multilabel_loss_v = {task_id: 0 for task_id in self.task_ids}
         self.kl_entropy_t = {task_id: 0 for task_id in self.task_ids}
         self.kl_entropy_v = {task_id: 0 for task_id in self.task_ids}
+        self.knn_kldiv = {task_id: 0 for task_id in self.task_ids}
         self.conf_discriminator_loss_t = {task_id: 0 for task_id in self.task_ids}
         self.conf_discriminator_loss_v = {task_id: 0 for task_id in self.task_ids}
 
@@ -420,12 +441,8 @@ def save(path, logger, epoch_id, model, optimizer, scheduler, global_step, tb_lo
             os.makedirs(path)
 
         model_to_save = model.module if hasattr(model, "module") else model  # Only save the model it-self
-        output_model_file = os.path.join(path, "pytorch_model_" + str(epoch_id) + ".bin")
-        torch.save(model_to_save.state_dict(), output_model_file)
-        if score is not None:
-            output_model_file = os.path.join(path, "pytorch_model_best.bin")
-            torch.save(model_to_save.state_dict(), output_model_file)
-        output_checkpoint = os.path.join(path, "pytorch_ckpt_latest.tar")
+        output_checkpoint = os.path.join(path, "pytorch_ckpt_" + str(epoch_id) + "_{}.tar".format(global_step))
+        #torch.save(model_to_save.state_dict(), output_model_file)
         torch.save(
             {"model_state_dict": model_to_save.state_dict(),
              "optimizer_state_dict": optimizer.state_dict(),
@@ -438,8 +455,25 @@ def save(path, logger, epoch_id, model, optimizer, scheduler, global_step, tb_lo
             output_checkpoint,
         )
 
+        if score is not None:
+            output_model_file = os.path.join(path, "pytorch_model_best.bin")
+            torch.save(model_to_save.state_dict(), output_model_file)
 
-def resume(path, model, optimizer, scheduler, tb_logger):
+        latest_checkpoint = os.path.join(path, "pytorch_ckpt_latest.tar")
+        torch.save(
+            {"model_state_dict": model_to_save.state_dict(),
+             "optimizer_state_dict": optimizer.state_dict(),
+             "scheduler_state_dict": scheduler.state_dict(),
+             "global_step": global_step,
+             "epoch_id": epoch_id,
+             "tb_logger": tb_logger,
+             "score": score,
+             },
+            latest_checkpoint,
+        )
+
+
+def resume(path, model, optimizer, scheduler, tb_logger, resume_from_next_epoch=True):
     start_iter_id = 0
     global_step = 0
     start_epoch = 0
@@ -456,7 +490,11 @@ def resume(path, model, optimizer, scheduler, tb_logger):
         scheduler.load_state_dict(checkpoint.get("scheduler_state_dict", checkpoint["scheduler_state_dict"]))
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         global_step = checkpoint["global_step"]
-        start_epoch = int(checkpoint["epoch_id"]) + 1
+
+        start_epoch = int(checkpoint["epoch_id"])
+        if resume_from_next_epoch:
+            start_epoch += 1
+
         if tb_logger:
             tb_logger = checkpoint["tb_logger"]
         best_score = checkpoint.get("score", float("-inf"))

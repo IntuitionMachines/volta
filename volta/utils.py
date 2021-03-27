@@ -452,7 +452,10 @@ class PreTrainedModel(nn.Module):
         model = cls(config, *model_args, **model_kwargs)
 
         if state_dict is None and not from_tf:
-            state_dict = torch.load(resolved_archive_file, map_location="cpu")
+            if os.path.splitext(resolved_archive_file)[-1] == '.tar':
+                state_dict = torch.load(resolved_archive_file, map_location="cpu")['model_state_dict']
+            else:
+                state_dict = torch.load(resolved_archive_file, map_location="cpu")
         if from_tf:
             # Directly load from a TensorFlow checkpoint
             return cls.load_tf_weights(model, config, resolved_archive_file[:-6])  # Remove the '.index'
