@@ -12,6 +12,7 @@ import logging
 import torch
 from torch import nn
 import torch.nn.functional as F
+import numpy as np
 
 from .embeddings import *
 from .config import BertConfig
@@ -1141,8 +1142,14 @@ class BertModel(BertPreTrainedModel):
                 pooled_output_t = self.t_pooler(sequence_output_t, text_end)
             else:
                 pooled_output_t = self.t_pooler(sequence_output_t)
+
+            if self.config.normalize_pooler_act:
+                pooled_output_t = F.normalize(pooled_output_t, dim=-1)
+
         elif input_type == 'visual':
             pooled_output_v = self.v_pooler(sequence_output_v)
+            if self.config.normalize_pooler_act:
+                pooled_output_v = F.normalize(pooled_output_v, dim=-1)
 
         if not output_all_encoded_layers:
             encoded_layers_t = encoded_layers_t[-1]
@@ -1169,6 +1176,7 @@ class BertForVLPreTraining(BertPreTrainedModel):
 
         self.add_global_imgfeat = int(config.add_global_imgfeat is not None)
         self.tie_weights()
+        self.config = config
 
     def _smooth_label(self, x, alpha=None):
         '''
@@ -1298,7 +1306,6 @@ class BertForVLPreTraining(BertPreTrainedModel):
         else:
             prediction_scores_t, prediction_scores_v_dict, seq_relationship_score, pooled_output = cls_outputs
 
-        discriminator_loss_t, discriminator_loss_v = 0, 0
         if confuse_discriminator_only:
             device = discriminator_score_t.device
             conf_discriminator_loss_t = self.loss_bce(discriminator_score_t,
@@ -1367,10 +1374,11 @@ class BertForVLPreTraining(BertPreTrainedModel):
 
             if (seq_relationship_score is not None) and (next_sentence_label is not None):
                 if self.config.fusion_method == 'diff_sq':
-                    pos = torch.mean(seq_relationship_score * (1 - next_sentence_label))
-                    neg = torch.mean(seq_relationship_score * next_sentence_label)
-                    next_sentence_loss = pos - neg
+                    pos = seq_relationship_score * next_sentence_label
+                    neg = seq_relationship_score * (1 - next_sentence_label)
+                    next_sentence_loss = (pos - neg).mean().unsqueeze(0)
                 else:
+                    # take indices of negative pairs
                     next_sentence_neg_entries = torch.where(next_sentence_label == 0)[0]
                     next_sentence_label[torch.where(caption_avail == 0)[0]] = -1
                     next_sentence_label[next_sentence_neg_entries] = 0  # keep the entries which are zero
