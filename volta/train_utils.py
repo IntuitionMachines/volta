@@ -82,7 +82,10 @@ class tbLogger(object):
         if self.save_logger:
             self.logger = SummaryWriter(log_dir=self.log_dir)
 
-        self.txt_f = open(self.txt_dir + "/" + "out.txt", "a")
+        try:
+            self.txt_f = open(self.txt_dir + "/" + "out.txt", "a")
+        except:
+            print('Warning: cannot open {}'.format(self.txt_dir + "/" + "out.txt"))
 
     @staticmethod
     def _detach_or_return_zero(x):
@@ -473,12 +476,14 @@ def save(path, logger, epoch_id, model, optimizer, scheduler, global_step, tb_lo
         )
 
 
-def resume(path, model, optimizer, scheduler, tb_logger, resume_from_next_epoch=True):
+def resume(path, model, optimizer, scheduler, tb_logger, resume_from_next_epoch=True,
+           loading_only_for_eval=False):
     start_iter_id = 0
     global_step = 0
     start_epoch = 0
     best_score = float("-inf")
     if path != "" and os.path.exists(path):
+        print('found {}'.format(path))
         checkpoint = torch.load(path, map_location="cpu")
         new_dict = {}
         for attr in checkpoint["model_state_dict"]:
@@ -486,20 +491,23 @@ def resume(path, model, optimizer, scheduler, tb_logger, resume_from_next_epoch=
                 new_dict[attr.replace("module.", "", 1)] = checkpoint["model_state_dict"][attr]
             else:
                 new_dict[attr] = checkpoint["model_state_dict"][attr]
+
         model.load_state_dict(new_dict)
-        scheduler.load_state_dict(checkpoint.get("scheduler_state_dict", checkpoint["scheduler_state_dict"]))
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        global_step = checkpoint["global_step"]
+        #model.load_state_dict(new_dict, strict=False)
+        if not loading_only_for_eval:
+            scheduler.load_state_dict(checkpoint.get("scheduler_state_dict", checkpoint["scheduler_state_dict"]))
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            global_step = checkpoint["global_step"]
 
-        start_epoch = int(checkpoint["epoch_id"])
-        if resume_from_next_epoch:
-            start_epoch += 1
+            start_epoch = int(checkpoint["epoch_id"])
+            if resume_from_next_epoch:
+                start_epoch += 1
 
-        if tb_logger:
-            tb_logger = checkpoint["tb_logger"]
-        best_score = checkpoint.get("score", float("-inf"))
-        del checkpoint
+            if tb_logger:
+                tb_logger = checkpoint["tb_logger"]
+            best_score = checkpoint.get("score", float("-inf"))
 
         print('Starting from epoch {}...'.format(start_epoch))
+        del checkpoint
 
     return start_iter_id, global_step, start_epoch, tb_logger, best_score

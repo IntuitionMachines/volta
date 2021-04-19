@@ -136,6 +136,26 @@ def xent_1601(prediction_scores_v, weight, label, image_cls, image_feat, obj_lab
     else:
         return 0
 
+def kl_1601_nomask(prediction_scores_v, weight, label, image_cls, image_feat, obj_labels, obj_confs, attr_labels, attr_confs):
+    if (weight > 0) and (image_cls is not None):
+        image_target = image_cls
+        #loss = nn.KLDivLoss(reduction="mean")(F.log_softmax(prediction_scores_v, dim=2), image_target)
+        loss = nn.KLDivLoss(reduction="none")(F.log_softmax(prediction_scores_v, dim=2), image_target)
+        loss = loss.sum(2).mean()
+        return weight * loss
+    else:
+        return 0
+
+def kl_1601_multilabel(prediction_scores_v, weight, label, image_cls, image_feat, obj_labels, obj_confs, attr_labels, attr_confs):
+    if (weight > 0) and (image_cls is not None):
+        image_target = image_cls    # (batch, n_regions, 1601)
+        mean_image_target = image_target.mean(1)    # (batch, 1601)
+        loss = nn.KLDivLoss(reduction="none")(F.log_softmax(prediction_scores_v, dim=1), mean_image_target)
+        loss = loss.sum(1).mean()
+        return weight * loss
+    else:
+        return 0
+
 
 pre_vis_targets = {
     "0": 1601,
@@ -146,6 +166,7 @@ pre_vis_targets = {
     "5": 2048,
     "6": 1601,
     "7": 1600,
+    "8": 1601,
 }
 
 pre_vis_criterions = {
@@ -157,4 +178,5 @@ pre_vis_criterions = {
     "5": huber_2048,
     "6": xent_1601,
     "7": xent_1600_nomask,
+    "8": kl_1601_nomask,
 }

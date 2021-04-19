@@ -450,7 +450,6 @@ class PreTrainedModel(nn.Module):
 
         # Instantiate model.
         model = cls(config, *model_args, **model_kwargs)
-
         if state_dict is None and not from_tf:
             if os.path.splitext(resolved_archive_file)[-1] == '.tar':
                 state_dict = torch.load(resolved_archive_file, map_location="cpu")['model_state_dict']

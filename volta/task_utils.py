@@ -335,6 +335,9 @@ def LoadDataset(args, config, task_cfg, task_id, split="trainval"):
 
     logger.info("Loading %s Dataset with batch size %d" % (task_name, batch_size))
     dset_train, dset_train, task2num_iters = None, None, {}
+
+    remove_SEP_token = config.remove_SEP if hasattr(config, 'remove_SEP') else False
+    remove_CLS_token = config.remove_CLS if hasattr(config, 'remove_CLS') else False
     if "train" in split:
         dset_train = DatasetMapTrain[task_name](
             task=task_cfg[task]["name"],
@@ -351,6 +354,8 @@ def LoadDataset(args, config, task_cfg, task_id, split="trainval"):
             num_locs=config.num_locs,
             add_global_imgfeat=config.add_global_imgfeat,
             append_mask_sep=(config.fusion_method == 'vl-bert_vqa'),
+            remove_CLS_token=remove_CLS_token,
+            remove_SEP_token=remove_SEP_token,
         )
         if args.local_rank == -1:
             train_sampler = RandomSampler(dset_train)
@@ -383,6 +388,8 @@ def LoadDataset(args, config, task_cfg, task_id, split="trainval"):
             num_locs=config.num_locs,
             add_global_imgfeat=config.add_global_imgfeat,
             append_mask_sep=(config.fusion_method == 'vl-bert_vqa'),
+            remove_CLS_token=remove_CLS_token,
+            remove_SEP_token=remove_SEP_token,
         )
         dl_val = DataLoader(
             dset_val,
@@ -420,6 +427,8 @@ def LoadDatasetEval(args, config, task_cfg, task_id):
     else:
         eval_split = task_cfg[task]["val_split"]
 
+    remove_SEP_token = config.remove_SEP if hasattr(config, 'remove_SEP') else False
+    remove_CLS_token = config.remove_CLS if hasattr(config, 'remove_CLS') else False
     dset_val = DatasetMapEval[task_name](
         task=task_cfg[task]["name"],
         dataroot=task_cfg[task]["dataroot"],
@@ -435,6 +444,8 @@ def LoadDatasetEval(args, config, task_cfg, task_id):
         num_locs=config.num_locs,
         add_global_imgfeat=config.add_global_imgfeat,
         append_mask_sep=(config.fusion_method == 'vl-bert_vqa'),
+        remove_CLS_token=remove_CLS_token,
+        remove_SEP_token=remove_SEP_token
     )
 
     dl_val = DataLoader(

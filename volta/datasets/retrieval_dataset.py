@@ -65,6 +65,8 @@ class RetrievalDataset(Dataset):
         num_locs=5,
         add_global_imgfeat=None,
         append_mask_sep=False,
+        remove_CLS_token=False,
+        remove_SEP_token=False,
     ):
         # All the keys in `self._entries` would be present in `self._image_features_reader`
         self._entries, self.imgid2entry = _load_annotations(annotations_jsonpath, task)
@@ -79,6 +81,10 @@ class RetrievalDataset(Dataset):
         self._max_seq_length = max_seq_length
         self._num_locs = num_locs
         self._add_global_imgfeat = add_global_imgfeat
+        self.remove_CLS_token = remove_CLS_token
+        self.remove_SEP_token = remove_SEP_token
+
+        name = '_no_CLS_SEP' if self.remove_CLS_token and self.remove_SEP_token else ''
 
         if self._split == "train":
             image_info = cPickle.load(open(os.path.join(dataroot, "hard_negative" + ".pkl"), "rb"))
@@ -97,6 +103,7 @@ class RetrievalDataset(Dataset):
                 + split
                 + "_"
                 + "roberta"
+                + name
                 + "_"
                 + str(max_seq_length)
                 + ".pkl",
@@ -109,11 +116,11 @@ class RetrievalDataset(Dataset):
                 task
                 + "_"
                 + split
+                + name
                 + "_"
                 + str(max_seq_length)
                 + ".pkl",
             )
-
         if not os.path.exists(cache_path):
             self.tokenize()
             self.tensorize()
@@ -129,10 +136,12 @@ class RetrievalDataset(Dataset):
         -1 represents nil, and should be treated as padding_idx in embedding.
         """
         for entry in self._entries:
-
             tokens = self._tokenizer.encode(entry["caption"])
-            tokens = tokens[: self._max_seq_length - 2]
-            tokens = self._tokenizer.add_special_tokens_single_sentence(tokens)
+            if not self.remove_CLS_token or not self.remove_SEP_token:
+                tokens = tokens[: self._max_seq_length - 2]
+                tokens = self._tokenizer.add_special_tokens_single_sentence(tokens)
+            else:
+                tokens = tokens[:self._max_seq_length]
 
             segment_ids = [0] * len(tokens)
             input_mask = [1] * len(tokens)
@@ -298,7 +307,9 @@ class RetrievalDatasetVal(Dataset):
         max_region_num: int = 36,
         num_locs=5,
         add_global_imgfeat=None,
-        append_mask_sep=False
+        append_mask_sep=False,
+        remove_CLS_token=False,
+        remove_SEP_token=False,
     ):
         # All the keys in `self._entries` would be present in `self._image_features_reader`
         self._image_entries, self._caption_entries = _load_annotationsVal(annotations_jsonpath, task)
@@ -312,6 +323,8 @@ class RetrievalDatasetVal(Dataset):
         self._num_locs = num_locs
         self._add_global_imgfeat = add_global_imgfeat
         self.num_labels = 1
+        self.remove_CLS_token = remove_CLS_token
+        self.remove_SEP_token = remove_SEP_token
 
         self.tokenize()
         self.tensorize()
@@ -359,8 +372,11 @@ class RetrievalDatasetVal(Dataset):
         """
         for entry in self._caption_entries:
             tokens = self._tokenizer.encode(entry["caption"])
-            tokens = tokens[: self._max_seq_length - 2]
-            tokens = self._tokenizer.add_special_tokens_single_sentence(tokens)
+            if not self.remove_CLS_token or not self.remove_SEP_token:
+                tokens = tokens[: self._max_seq_length - 2]
+                tokens = self._tokenizer.add_special_tokens_single_sentence(tokens)
+            else:
+                tokens = tokens[:self._max_seq_length]
 
             segment_ids = [0] * len(tokens)
             input_mask = [1] * len(tokens)

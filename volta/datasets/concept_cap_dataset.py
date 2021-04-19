@@ -204,6 +204,8 @@ class ConceptCapLoaderTrain(object):
         add_global_imgfeat=None,
         visual_target_categories_file=None,
         caption_availability=1.,
+        remove_CLS_token=False,
+        remove_SEP_token=False,
     ):
         if dist.is_available() and local_rank != -1:
             rank = dist.get_rank()
@@ -231,7 +233,9 @@ class ConceptCapLoaderTrain(object):
             num_locs=num_locs,
             visual_target_categories_file=visual_target_categories_file,
             caption_availability=self.caption_availability_dict,
-            ext_corpus=['bookcorpus']
+            ext_corpus=[],
+            remove_CLS_token=remove_CLS_token,
+            remove_SEP_token=remove_SEP_token
         )
 
         ds = td.PrefetchData(ds, 10000, 1)
@@ -386,7 +390,9 @@ class ConceptCapLoaderVal(object):
             add_global_imgfeat=True,
             visualization=False,
             visual_target_categories_file=None,
-            caption_availability=1.
+            caption_availability=1.,
+            remove_CLS_token=False,
+            remove_SEP_token=False,
     ):
         lmdb_file = os.path.join(features_path, "validation_feat_all.lmdb")
         caption_path = os.path.join(annotations_path, "caption_valid.json")
@@ -406,7 +412,9 @@ class ConceptCapLoaderVal(object):
             objective=objective,
             num_locs=num_locs,
             visual_target_categories_file=visual_target_categories_file,
-            caption_availability=self.caption_availability_dict
+            caption_availability=self.caption_availability_dict,
+            remove_CLS_token=remove_CLS_token,
+            remove_SEP_token=remove_SEP_token
         )
 
         ds = td.MapData(ds, preprocess_function)
@@ -515,6 +523,8 @@ class BertPreprocessBatch(object):
             visual_target_categories_file=None,
             caption_availability={},
             ext_corpus=[],
+            remove_CLS_token=False,
+            remove_SEP_token=False,
     ):
 
         self.split = split
@@ -537,6 +547,8 @@ class BertPreprocessBatch(object):
         self.tokenize_visual_categories = True if (self.vis_categories is not None and
                                                    self.vis_att_categories is not None) else False
         self.caption_availability = caption_availability
+        self.remove_CLS_token = remove_CLS_token
+        self.remove_SEP_token = remove_SEP_token
 
     def _img_token_to_name(self, obj_labels, attr_labels):
         obj_tokens = [self.vis_category_to_tokenIds[i] for i in obj_labels]
@@ -681,7 +693,6 @@ class BertPreprocessBatch(object):
                 self.vis_category_to_tokenIds[0] converts 0 to a sequence of language tokens [10930, 13687, 0, 0, 0], 
                 where 0 are [PAD] tokens. Number of zeros is according to `max_length`.
             '''
-
             self.vis_category_to_tokenIds = []
             self.vis_att_category_to_tokenIds = []
             for item in categories['categories']:
@@ -713,7 +724,7 @@ class BertPreprocessBatch(object):
         if (self.objective == 0 or self.objective == 1 or self.objective == 3) and random.random() > 0.5:
             caption = self.get_random_caption()
             label = 0
-        elif self.objective == 4:
+        elif self.objective == 4 or self.objective == 5:
             # objective 4, always sample negative pairs
             caption = self.get_random_caption()
             label = 0
@@ -743,18 +754,22 @@ class BertPreprocessBatch(object):
         num_boxes = int(example.num_boxes)
         overlaps = example.overlaps
 
-        self._truncate_seq_pair(tokens, max_seq_length - 2)
+        if not self.remove_CLS_token or not self.remove_SEP_token:
+            self._truncate_seq_pair(tokens, max_seq_length - 2)
+        else:
+            self._truncate_seq_pair(tokens, max_seq_length)
 
         tokens, tokens_label = self.random_word(tokens, tokenizer)
         image_feat, image_loc, image_label, masked_label = self.random_region(
             image_feat, image_loc, num_boxes, overlaps
         )
 
-        # concatenate lm labels and account for CLS and SEP: [CLS] tokens [SEP]
-        lm_label_ids = [-1] + tokens_label + [-1]
-        tokens = tokenizer.add_special_tokens_single_sentence(tokens)
-        segment_ids = [0] * len(tokens)
+        if not self.remove_CLS_token or not self.remove_SEP_token:
+            # concatenate lm labels and account for CLS and SEP: [CLS] tokens [SEP]
+            lm_label_ids = [-1] + tokens_label + [-1]
+            tokens = tokenizer.add_special_tokens_single_sentence(tokens)
 
+        segment_ids = [0] * len(tokens)
         input_ids = tokens
 
         # The mask has 1 for real tokens and 0 for padding tokens. Only real tokens are attended to.

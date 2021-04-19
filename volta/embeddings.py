@@ -409,7 +409,14 @@ class UniterEmbeddings(nn.Module):
 
         self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=0)
         self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
-        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
+
+        if hasattr(config, 'remove_token_type_embedding'):
+            if not config.remove_token_type_embedding:
+                self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
+            else:
+                self.token_type_embeddings = None
+        else:
+            self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
 
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
@@ -441,16 +448,21 @@ class UniterEmbeddings(nn.Module):
 
         words_embeddings = self.word_embeddings(token_ids)
         position_embeddings = self.position_embeddings(position_ids)
-        token_type_embeddings = self.token_type_embeddings(token_type_ids)
-        embeddings = words_embeddings + position_embeddings + token_type_embeddings
+        embeddings = words_embeddings + position_embeddings
+        if self.token_type_embeddings is not None:
+            token_type_embeddings = self.token_type_embeddings(token_type_ids)
+            embeddings += token_type_embeddings
+
         embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
 
         img_embeddings = self.image_layer_norm(self.image_embeddings(image_feat))
         loc_embeddings = self.image_location_layer_norm(self.image_location_embeddings(image_loc))
         img_type_ids = torch.ones_like(image_feat[:, :, 0].long())
-        v_token_type_embeddings = self.token_type_embeddings(img_type_ids)
-        v_embeddings = img_embeddings + loc_embeddings + v_token_type_embeddings
+        v_embeddings = img_embeddings + loc_embeddings
+        if self.token_type_embeddings is not None:
+            v_token_type_embeddings = self.token_type_embeddings(img_type_ids)
+            v_embeddings += v_token_type_embeddings
         v_embeddings = self.v_LayerNorm(v_embeddings)
         v_embeddings = self.v_dropout(v_embeddings)
 
@@ -468,7 +480,14 @@ class MixUniterEmbeddings(nn.Module):
 
         self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=0)
         self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
-        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
+
+        if hasattr(config, 'remove_token_type_embedding'):
+            if not config.remove_token_type_embedding:
+                self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
+            else:
+                self.token_type_embeddings = None
+        else:
+            self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
 
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
@@ -499,8 +518,12 @@ class MixUniterEmbeddings(nn.Module):
 
         words_embeddings = self.word_embeddings(token_ids)
         position_embeddings = self.position_embeddings(position_ids)
-        token_type_embeddings = self.token_type_embeddings(token_type_ids)
-        embeddings = words_embeddings + position_embeddings + token_type_embeddings
+
+        embeddings = words_embeddings + position_embeddings
+        if self.token_type_embeddings is not None:
+            token_type_embeddings = self.token_type_embeddings(token_type_ids)
+            embeddings += token_type_embeddings
+
         embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
 
@@ -512,8 +535,12 @@ class MixUniterEmbeddings(nn.Module):
         img_embeddings = self.image_layer_norm(self.image_embeddings(image_feat))
         loc_embeddings = self.image_location_layer_norm(self.image_location_embeddings(image_loc))
         img_type_ids = torch.ones_like(image_feat[:, :, 0].long())
-        v_token_type_embeddings = self.token_type_embeddings(img_type_ids)
-        v_embeddings = img_embeddings + loc_embeddings + v_token_type_embeddings
+
+        v_embeddings = img_embeddings + loc_embeddings
+        if self.token_type_embeddings is not None:
+            v_token_type_embeddings = self.token_type_embeddings(img_type_ids)
+            v_embeddings += v_token_type_embeddings
+
         v_embeddings = self.v_LayerNorm(v_embeddings)
         v_embeddings = self.v_dropout(v_embeddings)
 

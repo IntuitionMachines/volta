@@ -53,7 +53,7 @@ def parse_args():
                         help="The config file which specified the model details.")
     parser.add_argument("--resume_file", default="", type=str,
                         help="Resume from checkpoint")
-    parser.add_argument("--resume_from_next_epoch", action="store_true")
+    parser.add_argument("--resume_from_next_epoch", default=True, action="store_true")
 
     # Output
     parser.add_argument("--output_dir", default="checkpoints", type=str,
@@ -99,8 +99,9 @@ def parse_args():
                              "0: with ITM loss, \n"
                              "1: with ITM loss; for the not aligned pair, no masking objective, \n"
                              "2: without ITM loss, do not sample negative pair, \n"
-                             "3: without ITM loss, but still sample both positive and negative pairs, domain confusion \n"
-                             "4: without ITM loss, ALWAYS sample negative pairs, domain confusion")
+                             "3: without ITM loss, but still sample both positive and negative pairs, domain confusion, \n"
+                             "4: without ITM loss, ALWAYS sample negative pairs, domain confusion, \n"
+                             "5: without ITM loss, ALWAYS sample negative pairs, no domain confusion")
     parser.add_argument("--add_multi_label_loss_t", action="store_true")
     parser.add_argument("--add_multi_label_loss_v", action="store_true")
     parser.add_argument("--add_kl_entropy_reg", action="store_true")
@@ -228,8 +229,11 @@ def main():
         model = BertForVLPreTraining.from_pretrained(args.from_pretrained, config=config,
                                                      default_gpu=default_gpu, from_hf=True)
         # Resize type embeddings
-        model.bert.embeddings.token_type_embeddings = \
-            model._get_resized_embeddings(model.bert.embeddings.token_type_embeddings, type_vocab_size)
+        if hasattr(config, 'remove_token_type_embedding'):
+            if not config.remove_token_type_embedding:
+                model.bert.embeddings.token_type_embeddings = \
+                    model._get_resized_embeddings(model.bert.embeddings.token_type_embeddings, type_vocab_size)
+
         config.type_vocab_size = type_vocab_size
     else:
         model = BertForVLPreTraining(config)
@@ -299,6 +303,8 @@ def main():
     # Save starting model
     #save(save_path, logger, -1, model, optimizer, scheduler, global_step, tb_logger, default_gpu)
 
+    steps_per_epoch = float(num_train_optimization_steps / args.num_train_epochs)
+    start_epoch = int(global_step / steps_per_epoch)
     # Print summary
     if default_gpu:
         summary_parameters(model, logger)
@@ -306,6 +312,7 @@ def main():
         logger.info("  Num examples = %d", train_dataset.num_dataset)
         logger.info("  Batch size = %d", args.train_batch_size)
         logger.info("  Num steps = %d", num_train_optimization_steps)
+        logger.info('starting epoch adjusted: {}'.format(start_epoch))
 
     add_domain_confusion_loss = False
     if args.objective == 3 or args.objective == 4:
@@ -318,6 +325,7 @@ def main():
         else:
             model.update_v_prototypes((train_dataset.preprocess_function.vis_category_to_tokenIds,
                                        train_dataset.preprocess_function.vis_att_category_to_tokenIds))
+
 
     # Train
     for epoch_id in tqdm(range(start_epoch, int(args.num_train_epochs))):
@@ -340,8 +348,7 @@ def main():
             else:
                 raise ValueError
 
-            if (args.objective == 1 or args.objective == 3 or args.objective == 4) and \
-                    config.image_embeddings != 'mix_uniter':
+            if args.objective == 1 and config.image_embeddings != 'mix_uniter':
                 # Ignore labels (setting them to -1) for mismatched caption-image pairs
 
                 # The vision and text streams are anyway processed separately, so
@@ -354,7 +361,7 @@ def main():
             masked_loss_t, masked_loss_v, pair_match_loss, discriminator_loss_t, discriminator_loss_v, \
             multilabel_loss_t, multilabel_loss_v, kl_entropy_t, kl_entropy_v, knn_kldiv = \
                 model(input_ids, image_feat, image_loc, segment_ids, input_mask, image_mask, lm_label_ids, image_label,
-                      image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs, is_match, caption_avail, False,
+                      image_cls, obj_labels, obj_confs, attr_labels, attr_confs, image_attrs, is_match, caption_avail,
                       add_domain_confusion_loss=add_domain_confusion_loss,
                       add_multi_label_loss_t=args.add_multi_label_loss_t,
                       add_multi_label_loss_v=args.add_multi_label_loss_v,
@@ -373,6 +380,8 @@ def main():
             elif args.objective == 4:
                 pair_match_loss = pair_match_loss.detach()
                 loss += config.adversarial_weight * (discriminator_loss_t + discriminator_loss_v)
+            elif args.objective == 5:
+                pair_match_loss = pair_match_loss.detach()
             else:
                 loss += config.pair_match_loss_weight * pair_match_loss
 
@@ -446,8 +455,7 @@ def main():
                         attr_labels, attr_confs, image_attrs, image_label, image_mask, \
                         obj_tokens, attr_tokens, caption_avail = prev_batch
 
-                        if (args.objective == 1 or args.objective == 3 or args.objective == 4) and \
-                                config.image_embeddings != 'mix_uniter':
+                        if args.objective == 1 and config.image_embeddings != 'mix_uniter':
                             # Ignore labels (setting them to -1) for mismatched caption-image pairs
                             image_label = image_label * (is_match == 0).long().unsqueeze(1)
                             image_label[image_label == 0] = -1
@@ -493,9 +501,9 @@ def main():
             if (step % (100 * args.grad_acc_steps) == 0) and step != 0 and default_gpu:
                 tb_logger.showLossTrainCC()
 
-            if global_step > 0 and global_step % 10000 == 0:
-                save(save_path, logger, epoch_id, model, optimizer, scheduler, global_step, tb_logger,
-                     default_gpu)
+            #if global_step > 0 and global_step % 10000 == 0:
+            #    save(save_path, logger, epoch_id, model, optimizer, scheduler, global_step, tb_logger,
+            #         default_gpu)
 
         # Do the evaluation
         torch.set_grad_enabled(False)
@@ -539,6 +547,8 @@ def main():
             elif args.objective == 4:
                 pair_match_loss = pair_match_loss.detach()
                 loss += config.adversarial_weight * (discriminator_loss_t + discriminator_loss_v)
+            elif args.objective == 5:
+                pair_match_loss = pair_match_loss.detach()
             else:
                 loss += pair_match_loss
 
@@ -578,8 +588,8 @@ def main():
                                       float(multilabel_loss_t), float(multilabel_loss_v),
                                       float(kl_entropy_t), float(kl_entropy_v), float(knn_kldiv),
                                       "TASK0", batch_size, "val")
-                sys.stdout.write("%d / %d \r" % (step, numBatches))
-                sys.stdout.flush()
+                #sys.stdout.write("%d / %d \r" % (step, numBatches))
+                #sys.stdout.flush()
 
         if default_gpu:
             tb_logger.showLossValCC()

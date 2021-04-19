@@ -176,6 +176,9 @@ def main():
     batch_size, task2num_iters, dset_train, dset_val, dl_train, dl_val = LoadDataset(args, config, task_cfg, args.task)
 
     # Seed
+    if dist.is_available() and args.local_rank != -1:
+        args.seed += args.local_rank
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -196,7 +199,12 @@ def main():
 
     if "roberta" in args.bert_model:
         config.model = "roberta"
-    model = BertForVLTasks.from_pretrained(args.from_pretrained, config=config, task_cfg=task_cfg, task_ids=[task])
+    if args.from_pretrained and args.from_pretrained == "bert-base-uncased":
+        from_hf = True
+    else:
+        from_hf = False
+    model = BertForVLTasks.from_pretrained(args.from_pretrained, config=config, task_cfg=task_cfg, task_ids=[task],
+                                           from_hf=from_hf)
     if task_cfg[task].get("embed_clf", None):
         logger.info('Initializing classifier weight for %s from pretrained word embeddings...' % task)
         answers_word_embed = []
